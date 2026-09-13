@@ -462,13 +462,26 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
                 block_start=start_row, block_end=end_row)
 
 
+class EngineError(Exception):
+    """Raised with a status code (not a human message) so the caller (the
+    Streamlit app) can localize it."""
+    pass
+
+
 def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=None):
     """balance_sheets: list of openpyxl Workbook objects (one per style).
-    Mutates fr_wb in place. Returns a list of per-style result dicts."""
+    Mutates fr_wb in place. Returns a list of per-style result dicts.
+    `status` is always a machine-readable code (see STATUS_* constants),
+    never a human-language string, so the UI layer can localize it:
+      - "ok"
+      - "no_style"                 - could not find style number in Balance Sheet
+      - "no_trim_section"          - could not find GENERAL TRIM section
+      - "style_not_found_in_fr"    - style not present in the FR chart
+    """
     ws = fr_wb[fr_sheet_name]
     style_col, trim_col, already_expanded = find_fr_layout(ws)
     if style_col is None or trim_col is None:
-        raise ValueError("FR 차트에서 STYLE NO / TRIM 컬럼을 찾지 못했습니다.")
+        raise EngineError("fr_columns_not_found")
 
     if not already_expanded:
         setup_trim_grid_columns(ws, trim_col)
@@ -480,22 +493,22 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         layout = find_trim_section_layout(bs_ws)
         entry = {"sheet": bs_ws.title, "style": style_number}
         if style_number is None:
-            entry["status"] = "style 번호를 찾지 못함"
+            entry["status"] = "no_style"
             results.append(entry)
             continue
         if layout is None:
-            entry["status"] = "GENERAL TRIM 섹션을 찾지 못함"
+            entry["status"] = "no_trim_section"
             results.append(entry)
             continue
 
         rows_out = extract_trim_rows(bs_ws, layout, split_keyword=split_keyword)
         res = fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out)
         if res is None:
-            entry["status"] = f"FR 차트에서 STYLE {style_number} 를 찾지 못함"
+            entry["status"] = "style_not_found_in_fr"
             results.append(entry)
             continue
         entry.update(res)
-        entry["status"] = "완료"
+        entry["status"] = "ok"
         entry["lines"] = len(rows_out)
         results.append(entry)
 

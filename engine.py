@@ -497,21 +497,38 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
 
     blocks = enumerate_style_blocks(ws, style_col)
 
-    # Outer-zone blank-cell cleanup runs across the WHOLE data range, not
-    # just inside the row spans enumerate_style_blocks found - a gap
-    # between blocks, or trailing rows after the last style (this sheet
-    # has 2: rows 438-439 sit below the last style block but above
-    # ws.max_row), would otherwise never get touched even though they're
-    # visually part of the same messy area.
-    if outer_start <= last_col and blocks:
+    if blocks:
         data_start = blocks[0][1]
         data_end = ws.max_row
+
+        # The real source of the "messy from column X" look: many rows in
+        # this chart carry a ROW-LEVEL default style (Excel writes this
+        # when someone selects entire rows, e.g. row headers 151:251, and
+        # applies a border) rather than per-cell formatting. That default
+        # applies to every column out to Excel's absolute last column
+        # (XFD) for any cell that doesn't have its own explicit style, so
+        # it's invisible to (and unreachable by) per-cell iteration bounded
+        # by ws.max_column, however far right that scans. Clearing it here
+        # is safe: any real cell in this row that has its own explicit
+        # style (every cell this tool or the original template ever wrote
+        # to, all the way through the TRIM grid) keeps that style, since a
+        # cell's own style always overrides the row default - only the
+        # genuinely-untouched area beyond it was ever showing this line.
+        no_row_border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
         for rr in range(data_start, data_end + 1):
-            for cc in range(outer_start, last_col + 1):
-                cell = ws.cell(row=rr, column=cc)
-                if cell.value is None or str(cell.value).strip() == "":
-                    cell.border = no_border
-                    cell.fill = white_fill
+            ws.row_dimensions[rr].border = no_row_border
+
+        # Per-cell cleanup for the outer zone too (belt and suspenders for
+        # any cell that was individually styled rather than inheriting the
+        # row default, and to lay down a plain white fill so nothing shows
+        # through once gridlines are off).
+        if outer_start <= last_col:
+            for rr in range(data_start, data_end + 1):
+                for cc in range(outer_start, last_col + 1):
+                    cell = ws.cell(row=rr, column=cc)
+                    if cell.value is None or str(cell.value).strip() == "":
+                        cell.border = no_border
+                        cell.fill = white_fill
 
     for style_value, start, end in blocks:
         mc = find_merge_at(ws, start, trim_col)

@@ -227,8 +227,17 @@ def _fmt_qty(vals):
     return " / ".join(parts) if parts else ""
 
 
-def _all_filled(*vals):
-    return all(v is not None and str(v).strip() != "" for v in vals)
+def _has_value(v):
+    return v is not None and str(v).strip() != ""
+
+
+def _any_filled(*vals):
+    """True if at least one of the given raw values is non-blank. Column
+    positions are never assumed here - callers always pass the values found
+    via the dynamically-detected ETD/ETA/Tracking#/Shipped-Qty columns for
+    that shipment leg, since column numbers differ between Balance Sheet
+    files."""
+    return any(_has_value(v) for v in vals)
 
 
 def extract_trim_rows(ws, layout, split_keyword="hangtag"):
@@ -282,37 +291,40 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                 for rr in sub_rows:
                     size = _clean(ws.cell(row=rr, column=col_size).value) if col_size else ""
                     label = f"{item_clean} ({size})" if size else item_clean
-                    etd1 = _fmt_date(eff(rr, c_etd1))
-                    eta1 = _fmt_date(eff(rr, c_eta1))
-                    track1 = _clean(eff(rr, c_track1))
-                    qty1 = _fmt_qty([ws.cell(row=rr, column=c_qty1).value]) if c_qty1 else ""
-                    rows_out.append((label, etd1, eta1, track1, qty1))
+
+                    etd1_raw = eff(rr, c_etd1)
+                    eta1_raw = eff(rr, c_eta1)
+                    track1_raw = eff(rr, c_track1)
+                    qty1_raw = ws.cell(row=rr, column=c_qty1).value if c_qty1 else None
+                    if _any_filled(etd1_raw, eta1_raw, track1_raw, qty1_raw):
+                        rows_out.append((label, _fmt_date(etd1_raw), _fmt_date(eta1_raw),
+                                          _clean(track1_raw), _fmt_qty([qty1_raw])))
 
                     if c_etd2:
                         etd2_raw = eff(rr, c_etd2)
                         eta2_raw = eff(rr, c_eta2)
                         track2_raw = eff(rr, c_track2)
                         qty2_raw = ws.cell(row=rr, column=c_qty2).value if c_qty2 else None
-                        if _all_filled(etd2_raw, eta2_raw, track2_raw, qty2_raw):
+                        if _any_filled(etd2_raw, eta2_raw, track2_raw, qty2_raw):
                             rows_out.append((f"{label}-2nd", _fmt_date(etd2_raw), _fmt_date(eta2_raw),
                                               _clean(track2_raw), _fmt_qty([qty2_raw])))
             else:
-                etd1 = _fmt_date(eff(start, c_etd1))
-                eta1 = _fmt_date(eff(start, c_eta1))
-                track1 = _clean(eff(start, c_track1))
-                qtys1 = [ws.cell(row=rr, column=c_qty1).value for rr in range(start, end + 1)] if c_qty1 else []
-                qty1 = _fmt_qty(qtys1)
-                rows_out.append((item_clean, etd1, eta1, track1, qty1))
+                etd1_raw = eff(start, c_etd1)
+                eta1_raw = eff(start, c_eta1)
+                track1_raw = eff(start, c_track1)
+                qtys1_raw = [ws.cell(row=rr, column=c_qty1).value for rr in range(start, end + 1)] if c_qty1 else []
+                if _any_filled(etd1_raw, eta1_raw, track1_raw, *qtys1_raw):
+                    rows_out.append((item_clean, _fmt_date(etd1_raw), _fmt_date(eta1_raw),
+                                      _clean(track1_raw), _fmt_qty(qtys1_raw)))
 
                 if c_etd2:
                     etd2_raw = eff(start, c_etd2)
                     eta2_raw = eff(start, c_eta2)
                     track2_raw = eff(start, c_track2)
-                    qtys2 = [ws.cell(row=rr, column=c_qty2).value for rr in range(start, end + 1)] if c_qty2 else []
-                    qty2_val = qtys2[0] if qtys2 else None
-                    if _all_filled(etd2_raw, eta2_raw, track2_raw, qty2_val):
+                    qtys2_raw = [ws.cell(row=rr, column=c_qty2).value for rr in range(start, end + 1)] if c_qty2 else []
+                    if _any_filled(etd2_raw, eta2_raw, track2_raw, *qtys2_raw):
                         rows_out.append((f"{item_clean}-2nd", _fmt_date(etd2_raw), _fmt_date(eta2_raw),
-                                          _clean(track2_raw), _fmt_qty(qtys2)))
+                                          _clean(track2_raw), _fmt_qty(qtys2_raw)))
         r = end + 1
 
     return rows_out
@@ -323,23 +335,35 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
 # --------------------------------------------------------------------------
 
 def find_fr_layout(ws):
-    """Find the STYLE NO column and the (original, single-column) TRIM
-    column in the FR chart, and whether the sheet has already been
-    expanded into the 5-column grid by a previous run of this tool."""
+    """Find the STYLE NO column and the TRIM column in the FR chart, and
+    whether the sheet has already been expanded into the 5-column grid by
+    an earlier run of this tool. Both states must be detected here, since
+    an already-expanded file gets re-uploaded for later batches (and the
+    original row-3 "trim" label is gone by then - row 3 there now reads
+    "Item", the first of this tool's own 5 sub-labels, with "TRIM" moved
+    up to the row-2 banner instead)."""
     style_col = None
-    trim_col = None
+    trim_col_original = None   # row3 cell == "trim" -> not expanded yet
+    trim_col_expanded = None   # row3 cell == "item" under a "TRIM" row2 banner
     for c in range(1, min(60, ws.max_column) + 1):
         v2 = ws.cell(row=2, column=c).value
         if v2 and "style" in str(v2).strip().lower() and style_col is None:
             style_col = c
         v3 = ws.cell(row=3, column=c).value
-        if v3 and str(v3).strip().lower() == "trim":
-            trim_col = c
-    already_expanded = False
-    if trim_col:
-        v = ws.cell(row=3, column=trim_col).value
-        already_expanded = (str(v).strip().lower() == "item")
-    return style_col, trim_col, already_expanded
+        if v3 is None:
+            continue
+        v3s = str(v3).strip().lower()
+        if v3s == "trim" and trim_col_original is None:
+            trim_col_original = c
+        if v3s == "item" and trim_col_expanded is None:
+            mc = find_merge_at(ws, 2, c)
+            banner_val = ws.cell(row=2, column=mc.min_col).value if mc else ws.cell(row=2, column=c).value
+            if banner_val and str(banner_val).strip().lower() == "trim":
+                trim_col_expanded = c
+
+    if trim_col_expanded is not None:
+        return style_col, trim_col_expanded, True
+    return style_col, trim_col_original, False
 
 
 def find_merge_at(ws, row, col):
@@ -407,6 +431,103 @@ def setup_trim_grid_columns(ws, trim_col):
         ws.column_dimensions[get_column_letter(col)].width = w
 
 
+def enumerate_style_blocks(ws, style_col):
+    """Return [(style_value, start_row, end_row), ...] for every style block
+    in the FR sheet, using the style_col merges to find each block's row
+    span. Data is assumed to start right after the header block that sits
+    on top of style_col (found dynamically, never hardcoded)."""
+    header_mc = find_merge_at(ws, 2, style_col) or find_merge_at(ws, 1, style_col)
+    data_start = (header_mc.max_row + 1) if header_mc else 4
+
+    blocks = []
+    r = data_start
+    max_row = ws.max_row
+    while r <= max_row:
+        v = ws.cell(row=r, column=style_col).value
+        if v is None or str(v).strip() == "":
+            r += 1
+            continue
+        mc = find_merge_at(ws, r, style_col)
+        start, end = (mc.min_row, mc.max_row) if mc else (r, r)
+        blocks.append((v, start, end))
+        r = end + 1
+    return blocks
+
+
+def clean_and_divide_style_blocks(ws, style_col, trim_col):
+    """Runs on every process() call (including re-runs on an already
+    once-expanded file, so it also retroactively cleans up a live file the
+    user re-uploads), after all Balance Sheets for this run have been
+    filled in. For every style block in the sheet:
+      - Everything to the right of this tool's own TRIM grid/Trim-Test
+        banner (trim_col+6 onward - derived from trim_col, never a
+        hardcoded column letter, since that area's width varies by file)
+        has its cell borders cleared ("made transparent"), since that's
+        the area the user said looks messy with leftover default gridlines.
+      - A style block whose Trim grid is still a single, untouched
+        one-column merge (i.e. this tool hasn't filled it from a Balance
+        Sheet) has that merge widened across the full 5-column grid width
+        and its borders cleared too, so it renders as one clean blank cell
+        instead of a messy leftover grid.
+      - A style block that HAS been filled (fill_style_trim_grid already
+        unmerged it and wrote a clean bordered grid) is left as-is.
+      - Every block, filled or not, gets a bottom-border divider line at
+        its last row spanning from trim_col to the sheet's last column, so
+        consecutive styles stay easy to tell apart even once the interior
+        lines are cleared.
+    """
+    no_side = Side(style=None)
+    no_border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
+    thin = Side(style='thin', color='000000')
+
+    grid_last_col = trim_col + 4  # trim_col..trim_col+4 = our own 5-column grid
+    trim_test_col = trim_col + 5  # the original "Trim Test" column, pushed right by our
+                                   # column insert - left alone entirely (never merged
+                                   # into or bordered by this tool), since it may hold
+                                   # the team's own per-style data unrelated to Balance
+                                   # Sheet import
+    outer_start = trim_col + 6    # whatever the FR chart has further right, if anything
+    last_col = ws.max_column
+
+    blocks = enumerate_style_blocks(ws, style_col)
+    for style_value, start, end in blocks:
+        mc = find_merge_at(ws, start, trim_col)
+        untouched = mc is not None and mc.min_row == start and mc.max_row == end \
+            and mc.min_col == trim_col and mc.max_col == trim_col
+
+        if untouched:
+            ws.unmerge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                              end_row=mc.max_row, end_column=mc.max_col)
+            # Any other merge overlapping the target rectangle must be
+            # removed first - openpyxl does not check for overlaps, so
+            # merging over one would silently create two overlapping
+            # merged ranges and corrupt the file. In practice this only
+            # matters within our own 5 grid columns (trim_test_col is
+            # deliberately excluded above so its own merge is never touched).
+            for other in list(ws.merged_cells.ranges):
+                if other.max_row < start or other.min_row > end \
+                        or other.max_col < trim_col or other.min_col > grid_last_col:
+                    continue
+                ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
+                                  end_row=other.max_row, end_column=other.max_col)
+            ws.merge_cells(start_row=start, start_column=trim_col, end_row=end, end_column=grid_last_col)
+            for rr in range(start, end + 1):
+                for cc in range(trim_col, grid_last_col + 1):
+                    ws.cell(row=rr, column=cc).border = no_border
+
+        if outer_start <= last_col:
+            for rr in range(start, end + 1):
+                for cc in range(outer_start, last_col + 1):
+                    ws.cell(row=rr, column=cc).border = no_border
+
+        # style-boundary divider, across the grid + whatever is further right
+        for cc in range(trim_col, last_col + 1):
+            cell = ws.cell(row=end, column=cc)
+            existing = cell.border
+            cell.border = Border(left=existing.left, right=existing.right,
+                                  top=existing.top, bottom=thin)
+
+
 def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
     """Find the row block for `style_number` (freshly, since row positions
     may have shifted from earlier styles being grown) and write rows_out
@@ -424,9 +545,16 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
     if target_row is None:
         return None
 
-    mc = find_merge_at(ws, target_row, trim_col)
-    if mc:
-        start_row, end_row = mc.min_row, mc.max_row
+    # The style's true row span always comes from the STYLE column's own
+    # merge, never from the TRIM column's - the trim column's merge state
+    # varies (a single untouched column, a widened-but-empty grid left by
+    # the cleanup pass, or no merge at all once this tool has already
+    # written real data there on an earlier run), so it can't be trusted to
+    # reflect the block's actual height, especially when re-processing a
+    # style that was already filled before.
+    style_mc = find_merge_at(ws, target_row, style_col)
+    if style_mc:
+        start_row, end_row = style_mc.min_row, style_mc.max_row
     else:
         start_row = end_row = target_row
 
@@ -439,9 +567,18 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
         end_row += shortfall
         added_rows = shortfall
 
-    mc2 = find_merge_at(ws, start_row, trim_col)
-    if mc2:
-        ws.unmerge_cells(start_row=mc2.min_row, start_column=trim_col, end_row=mc2.max_row, end_column=trim_col)
+    # Clear out whatever currently occupies the trim grid columns for this
+    # block: unmerge anything overlapping that area (an untouched single
+    # column, or an already-widened empty grid from the cleanup pass). The
+    # original "Trim Test" column (trim_col+4 grid ends before it) is never
+    # touched here, so any data the team keeps there is preserved.
+    grid_last_col = trim_col + 4
+    for other in list(ws.merged_cells.ranges):
+        if other.max_row < start_row or other.min_row > end_row \
+                or other.max_col < trim_col or other.min_col > grid_last_col:
+            continue
+        ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
+                          end_row=other.max_row, end_column=other.max_col)
 
     thin = Side(style='thin', color='000000')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -457,6 +594,16 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
             c.font = font
             c.alignment = align
         ws.row_dimensions[rr].height = 22
+
+    # Clear any leftover rows below the newly written data within this
+    # block (e.g. an earlier run left more trim lines than this run needs).
+    no_side = Side(style=None)
+    no_border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
+    for rr in range(start_row + n_needed, end_row + 1):
+        for cc in range(trim_col, grid_last_col + 1):
+            cell = ws.cell(row=rr, column=cc)
+            cell.value = None
+            cell.border = no_border
 
     return dict(target_row=start_row, rows_written=n_needed, rows_added=added_rows,
                 block_start=start_row, block_end=end_row)
@@ -511,5 +658,9 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         entry["status"] = "ok"
         entry["lines"] = len(rows_out)
         results.append(entry)
+
+    # Runs every time (even on an already-expanded file), so it also
+    # retroactively cleans up styles left over from earlier runs.
+    clean_and_divide_style_blocks(ws, style_col, trim_col)
 
     return results

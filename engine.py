@@ -35,7 +35,7 @@ import re
 import copy
 import datetime
 from openpyxl.utils import get_column_letter, column_index_from_string
-from openpyxl.styles import Border, Side, Font, Alignment
+from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -459,11 +459,14 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
     once-expanded file, so it also retroactively cleans up a live file the
     user re-uploads), after all Balance Sheets for this run have been
     filled in. For every style block in the sheet:
-      - Everything to the right of this tool's own TRIM grid/Trim-Test
-        banner (trim_col+6 onward - derived from trim_col, never a
+      - Any BLANK cell to the right of this tool's own TRIM grid/Trim-Test
+        column (trim_col+6 onward - derived from trim_col, never a
         hardcoded column letter, since that area's width varies by file)
-        has its cell borders cleared ("made transparent"), since that's
-        the area the user said looks messy with leftover default gridlines.
+        has its border cleared and a plain white fill applied, so Excel's
+        default gridlines stop showing through it (that's the "messy from
+        column AM" look). A cell that already holds real content is left
+        completely untouched, in case that area holds other TNA data
+        unrelated to this tool.
       - A style block whose Trim grid is still a single, untouched
         one-column merge (i.e. this tool hasn't filled it from a Balance
         Sheet) has that merge widened across the full 5-column grid width
@@ -471,14 +474,17 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
         instead of a messy leftover grid.
       - A style block that HAS been filled (fill_style_trim_grid already
         unmerged it and wrote a clean bordered grid) is left as-is.
-      - Every block, filled or not, gets a bottom-border divider line at
-        its last row spanning from trim_col to the sheet's last column, so
-        consecutive styles stay easy to tell apart even once the interior
-        lines are cleared.
+      - Every block, filled or not, gets a permanent vertical divider line
+        between its own grid (Shipped Qty) and the original Trim Test
+        column, on every row - not left to whatever border the original
+        file happened to have there, which was inconsistent - plus a
+        bottom-border divider at its last row spanning from trim_col to the
+        sheet's last column, so consecutive styles stay easy to tell apart.
     """
     no_side = Side(style=None)
     no_border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
     thin = Side(style='thin', color='000000')
+    white_fill = PatternFill(fill_type="solid", start_color="FFFFFFFF", end_color="FFFFFFFF")
 
     grid_last_col = trim_col + 4  # trim_col..trim_col+4 = our own 5-column grid
     trim_test_col = trim_col + 5  # the original "Trim Test" column, pushed right by our
@@ -518,7 +524,18 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
         if outer_start <= last_col:
             for rr in range(start, end + 1):
                 for cc in range(outer_start, last_col + 1):
-                    ws.cell(row=rr, column=cc).border = no_border
+                    cell = ws.cell(row=rr, column=cc)
+                    if cell.value is None or str(cell.value).strip() == "":
+                        cell.border = no_border
+                        cell.fill = white_fill
+
+        # Permanent divider between our own grid and the original Trim Test
+        # column, on every row of the block (independent of whatever the
+        # original file's own formatting was there).
+        for rr in range(start, end + 1):
+            cell = ws.cell(row=rr, column=grid_last_col)
+            b = cell.border
+            cell.border = Border(left=b.left, top=b.top, bottom=b.bottom, right=thin)
 
         # style-boundary divider, across the grid + whatever is further right
         for cc in range(trim_col, last_col + 1):

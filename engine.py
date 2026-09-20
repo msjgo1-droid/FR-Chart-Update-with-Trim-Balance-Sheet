@@ -496,6 +496,23 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
     last_col = ws.max_column
 
     blocks = enumerate_style_blocks(ws, style_col)
+
+    # Outer-zone blank-cell cleanup runs across the WHOLE data range, not
+    # just inside the row spans enumerate_style_blocks found - a gap
+    # between blocks, or trailing rows after the last style (this sheet
+    # has 2: rows 438-439 sit below the last style block but above
+    # ws.max_row), would otherwise never get touched even though they're
+    # visually part of the same messy area.
+    if outer_start <= last_col and blocks:
+        data_start = blocks[0][1]
+        data_end = ws.max_row
+        for rr in range(data_start, data_end + 1):
+            for cc in range(outer_start, last_col + 1):
+                cell = ws.cell(row=rr, column=cc)
+                if cell.value is None or str(cell.value).strip() == "":
+                    cell.border = no_border
+                    cell.fill = white_fill
+
     for style_value, start, end in blocks:
         mc = find_merge_at(ws, start, trim_col)
         untouched = mc is not None and mc.min_row == start and mc.max_row == end \
@@ -520,14 +537,6 @@ def clean_and_divide_style_blocks(ws, style_col, trim_col):
             for rr in range(start, end + 1):
                 for cc in range(trim_col, grid_last_col + 1):
                     ws.cell(row=rr, column=cc).border = no_border
-
-        if outer_start <= last_col:
-            for rr in range(start, end + 1):
-                for cc in range(outer_start, last_col + 1):
-                    cell = ws.cell(row=rr, column=cc)
-                    if cell.value is None or str(cell.value).strip() == "":
-                        cell.border = no_border
-                        cell.fill = white_fill
 
         # Permanent divider between our own grid and the original Trim Test
         # column, on every row of the block (independent of whatever the

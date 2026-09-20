@@ -680,4 +680,15 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
     # retroactively cleans up styles left over from earlier runs.
     clean_and_divide_style_blocks(ws, style_col, trim_col)
 
+    # The "messy from column X onward" look the user sees is not actual
+    # cell formatting at all - it is Excel's own default gridline display
+    # over the sheet's genuinely empty area beyond its real used range (no
+    # cell there to style, so per-cell border/fill clearing can never
+    # reach it, however far it's scanned). Turning off gridlines for the
+    # whole sheet removes that clutter everywhere in one shot, and leaves
+    # every explicitly-formatted cell (which is the entire rest of this
+    # heavily-styled chart) looking exactly the same, since explicit
+    # borders/fills render independently of this view setting.
+    ws.sheet_view.showGridLines = False
+
     return results

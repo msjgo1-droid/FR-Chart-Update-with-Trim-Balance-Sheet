@@ -625,7 +625,7 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
 
     thin = Side(style='thin', color='000000')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    font = Font(name='Calibri', size=9)
+    font = Font(name='Calibri', size=20)
     align = Alignment(horizontal='left', vertical='center', wrap_text=True)
 
     for i, vals in enumerate(rows_out):
@@ -636,7 +636,7 @@ def fill_style_trim_grid(ws, style_col, trim_col, style_number, rows_out):
             c.border = border
             c.font = font
             c.alignment = align
-        ws.row_dimensions[rr].height = 22
+        ws.row_dimensions[rr].height = 50
 
     # Clear any leftover rows below the newly written data within this
     # block (e.g. an earlier run left more trim lines than this run needs).

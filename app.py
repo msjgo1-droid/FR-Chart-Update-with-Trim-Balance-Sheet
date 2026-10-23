@@ -22,14 +22,14 @@ TEXT = {
         ),
         "rules_expander": "ℹ️ 처리 규칙 (한번 확인해보세요)",
         "rules_md": """
-- Balance Sheet의 **GENERAL TRIM / SPECIAL TRIM** 항목표에서 **Item / ETD / ETA / Tracking# / Shipped Qty** (1st order and ship date 기준) 만 가져옵니다.
-- 값이 비어 있어도 1st shipment는 **그대로** 항목 라인을 만듭니다 (건너뛰지 않음).
+- Balance Sheet의 **GENERAL TRIM / SPECIAL TRIM** 항목표에서 **Item/Color, Qty Needed, Stock, Shipped Qty, ETD, ETA, AWB#(Tracking#)** 총 7개 항목을 **뜻으로** 찾아서 가져옵니다. 컬럼 순서나 정확한 표기(예: "Tracking#" vs "AWB#", "Shipped Qty" vs "QTY(PCS)", "Qty Needed" vs "QTY NEEDED")가 Balance Sheet마다 달라도 자동으로 인식됩니다.
 - 거래처(Mill/Supplier) 이름은 가져오지 않습니다.
 - 이름에 **"Hangtag"** 가 들어간 항목은 **사이즈별로 줄을 나눠서** 넣습니다.
-- **2nd order and ship date**가 있는 항목은, ETD/ETA/Tracking#/Shipped Qty가 **전부 채워져 있을 때만** `항목명-2nd` 라인을 추가로 넣습니다 (비어있으면 추가하지 않음).
-- FR 차트의 TRIM 칸(스타일당 1개 병합 셀)을 풀어서, **Item/ETD/ETA/Tracking#/Shipped Qty 5개 컬럼 x N개 행**의 실제 표(테두리 포함)로 바꿔 넣습니다.
+- **1st order**든 **2nd order**든, 그 shipment의 ETD/ETA/Tracking#/Shipped Qty **4개 중 하나라도 값이 있을 때만** 해당 라인을 추가합니다 (4개가 전부 비어있으면 그 shipment는 건너뜁니다). Qty Needed/Stock는 품목 단위 값이라 추가된 라인에 그대로 같이 들어갑니다.
+- FR 차트 쪽에서는 헤더에 **"trim"**이라는 단어가 들어간 칸(TRIM, TRIM SCHEDULE 등 무엇이든)을 자동으로 찾아 연동합니다. 이미 만들어져 있는 하위 컬럼(예: AWB#, QTY(PCS))은 그 자리 그대로 재사용하고, 7개 항목 중 아직 없는 것(예: Qty Needed, Stock)만 뒤에 새로 추가합니다 — 기존 데이터가 들어있는 컬럼은 절대 옮기지 않습니다.
+- 스타일당 TRIM 영역을 **7개 컬럼(Item / Qty Needed / Stock / Shipped Qty / ETD / ETA / AWB#(Tracking#)) x N개 행**의 실제 표(테두리 포함)로 바꿔 넣습니다.
 - 필요한 줄 수가 기존 스타일 블록의 행 수보다 많으면, 해당 스타일 블록 전체를 자동으로 늘리고 (다른 컬럼들의 병합, 수식, 아래 스타일들 위치도 같이 안전하게 조정) 부족한 만큼 채웁니다.
-- 헤더에 **BULK FB / TRIM** 그룹 제목과 구분선을 넣고, TRIM 아래에 컬럼 라벨(Item/ETD/ETA/Tracking#/Shipped Qty)을 넣습니다.
+- 헤더에 **BULK FB / TRIM** 그룹 제목과 구분선, 그리고 7개 컬럼 라벨을 자동으로 넣습니다. 라벨을 넣을 별도의 줄이 없는 파일이라면, 줄 하나를 새로 만들어서 라벨 전용으로 씁니다 (기존 데이터는 한 줄 아래로 안전하게 이동).
 """,
         "split_keyword_label": "사이즈별로 줄을 나눌 항목 키워드 (기본: hangtag)",
         "step1_header": "1. Balance Sheet 업로드 (여러 개 선택 가능, 스타일당 1개)",
@@ -42,8 +42,9 @@ TEXT = {
         "spinner": "처리 중입니다...",
         "process_error": "처리 중 오류가 발생했습니다: {e}",
         "results_header": "처리 결과",
-        "result_ok": "스타일 {style}: {lines}줄 반영 완료 (행 {start}~{end}{added})",
+        "result_ok": "스타일 {style}: {lines}줄 반영 완료 (행 {start}~{end}{added}{preserved})",
         "rows_added_suffix": ", {n}행 추가",
+        "rows_preserved_suffix": ", 기존에 적혀있던 {n}줄은 지우지 않고 아래로 내림",
         "result_warn": "스타일 {style} ({sheet}): {status}",
         "status_no_style": "Balance Sheet에서 스타일 번호를 찾지 못했습니다",
         "status_no_trim_section": "GENERAL TRIM 섹션을 찾지 못했습니다",
@@ -60,14 +61,14 @@ TEXT = {
         ),
         "rules_expander": "ℹ️ How it works (worth a quick read)",
         "rules_md": """
-- Pulls only **Item / ETD / ETA / Tracking# / Shipped Qty** (1st order and ship date) from the Balance Sheet's **GENERAL TRIM / SPECIAL TRIM** item table.
-- Blank values **are still included** as their own line for the 1st shipment (nothing is skipped).
+- Pulls 7 fields by **meaning**, not fixed position, from the Balance Sheet's **GENERAL TRIM / SPECIAL TRIM** item table: **Item/Color, Qty Needed, Stock, Shipped Qty, ETD, ETA, AWB#(Tracking#)**. Column order and exact wording can differ between files ("Tracking#" vs "AWB#", "Shipped Qty" vs "QTY (PCS)", "Qty Needed" vs "QTY NEEDED") and it still matches correctly.
 - Vendor / Mill-Supplier name is **not** included, to keep it as condensed as possible.
 - Any item whose name contains **"Hangtag"** is **split into one line per size**.
-- If an item has a **2nd order and ship date**, an extra `<item name>-2nd` line is added **only when** ETD/ETA/Tracking#/Shipped Qty are **all filled in** (blanks are not carried over for 2nd+ shipments).
-- The FR chart's TRIM cell (one merged cell per style) is unmerged and rebuilt as a real bordered table: **5 columns (Item / ETD / ETA / Tracking# / Shipped Qty) x N rows**.
+- For **either** the 1st or 2nd order leg, a line is only added when **at least one** of that leg's ETD/ETA/Tracking#/Shipped Qty is filled in - skipped entirely if all four are blank. Qty Needed/Stock are per-item, so they ride along on whichever lines do get added.
+- On the FR chart side, any header cell whose text contains **"trim"** (TRIM, TRIM SCHEDULE, or anything else with that word) is found automatically. Sub-columns that already exist there (e.g. AWB#, QTY (PCS)) are reused as-is; whichever of the 7 fields are still missing (e.g. Qty Needed, Stock) get appended as new columns - existing columns with real data are never moved.
+- The FR chart's TRIM area for each style is unmerged and rebuilt as a real bordered table: **7 columns (Item / Qty Needed / Stock / Shipped Qty / ETD / ETA / AWB#(Tracking#)) x N rows**.
 - If more rows are needed than the style's current row block has, the whole block is safely grown (other merged columns, formulas, and the position of styles below are all adjusted automatically).
-- Header banners **BULK FB / TRIM** with a divider, plus column labels (Item/ETD/ETA/Tracking#/Shipped Qty) under TRIM, are set up automatically.
+- Header banners **BULK FB / TRIM** with a divider, plus all 7 column labels, are set up automatically. If a chart has no row of its own for these labels, one is inserted so the labels get a permanent home (existing data shifts down by one row safely).
 """,
         "split_keyword_label": "Keyword for items to split by size (default: hangtag)",
         "step1_header": "1. Upload Balance Sheets (multiple allowed, one per style)",
@@ -80,8 +81,9 @@ TEXT = {
         "spinner": "Processing...",
         "process_error": "An error occurred while processing: {e}",
         "results_header": "Results",
-        "result_ok": "Style {style}: {lines} line(s) written (rows {start}-{end}{added})",
+        "result_ok": "Style {style}: {lines} line(s) written (rows {start}-{end}{added}{preserved})",
         "rows_added_suffix": ", {n} row(s) added",
+        "rows_preserved_suffix": ", kept {n} pre-existing line(s) below (not deleted)",
         "result_warn": "Style {style} ({sheet}): {status}",
         "status_no_style": "Could not find a style number in this Balance Sheet",
         "status_no_trim_section": "Could not find a GENERAL TRIM section",
@@ -98,14 +100,14 @@ TEXT = {
         ),
         "rules_expander": "ℹ️ Quy tắc xử lý (nên xem qua một lần)",
         "rules_md": """
-- Chỉ lấy **Item / ETD / ETA / Tracking# / Shipped Qty** (theo 1st order and ship date) từ bảng mục **GENERAL TRIM / SPECIAL TRIM** trong Balance Sheet.
-- Với 1st shipment, dòng vẫn được tạo **kể cả khi giá trị để trống** (không bỏ qua).
+- Lấy 7 thông tin theo **ý nghĩa**, không theo vị trí cố định, từ bảng mục **GENERAL TRIM / SPECIAL TRIM** trong Balance Sheet: **Item/Color, Qty Needed, Stock, Shipped Qty, ETD, ETA, AWB#(Tracking#)**. Thứ tự cột và cách ghi chính xác có thể khác nhau giữa các file ("Tracking#" vs "AWB#", "Shipped Qty" vs "QTY (PCS)", "Qty Needed" vs "QTY NEEDED") nhưng vẫn tự nhận diện đúng.
 - **Không** lấy tên nhà cung cấp (Mill/Supplier) để giữ nội dung gọn nhất có thể.
 - Các mục có tên chứa **"Hangtag"** sẽ được **tách riêng theo từng size**.
-- Nếu mục có **2nd order and ship date**, dòng bổ sung `<tên mục>-2nd` chỉ được thêm vào **khi cả 4 giá trị** ETD/ETA/Tracking#/Shipped Qty **đều có đầy đủ** (nếu còn trống thì không thêm).
-- Ô TRIM trong FR chart (1 ô gộp cho mỗi style) sẽ được tách ra và dựng lại thành bảng thật có viền: **5 cột (Item / ETD / ETA / Tracking# / Shipped Qty) x N dòng**.
+- Với **1st order** hoặc **2nd order**, dòng chỉ được thêm vào khi **có ít nhất một** trong 4 giá trị ETD/ETA/Tracking#/Shipped Qty của shipment đó được điền (nếu cả 4 đều trống thì bỏ qua shipment đó). Qty Needed/Stock là giá trị theo item nên sẽ đi kèm theo các dòng được thêm vào.
+- Ở phía FR chart, bất kỳ ô tiêu đề nào có chữ **"trim"** (TRIM, TRIM SCHEDULE, hoặc bất kỳ chữ nào có từ đó) đều được tự động tìm ra. Các cột con đã có sẵn (ví dụ AWB#, QTY (PCS)) sẽ được giữ nguyên vị trí; những cột nào trong 7 cột còn thiếu (ví dụ Qty Needed, Stock) sẽ được thêm mới vào — cột đã có dữ liệu thật thì không bao giờ bị di chuyển.
+- Ô TRIM trong FR chart (1 ô gộp cho mỗi style) sẽ được tách ra và dựng lại thành bảng thật có viền: **7 cột (Item / Qty Needed / Stock / Shipped Qty / ETD / ETA / AWB#(Tracking#)) x N dòng**.
 - Nếu số dòng cần nhiều hơn số hàng hiện có của khối style đó, toàn bộ khối sẽ được **tự động mở rộng** (các cột gộp khác, công thức, và vị trí của các style phía dưới đều được điều chỉnh an toàn).
-- Tiêu đề nhóm **BULK FB / TRIM** cùng đường phân cách, và nhãn cột (Item/ETD/ETA/Tracking#/Shipped Qty) bên dưới TRIM sẽ được tự động thêm vào.
+- Tiêu đề nhóm **BULK FB / TRIM** cùng đường phân cách, và đủ 7 nhãn cột, sẽ được tự động thêm vào. Nếu chart chưa có dòng riêng cho các nhãn này, một dòng mới sẽ được chèn vào để nhãn có vị trí cố định (dữ liệu cũ sẽ dịch xuống 1 dòng một cách an toàn).
 """,
         "split_keyword_label": "Từ khóa để tách dòng theo size (mặc định: hangtag)",
         "step1_header": "1. Tải lên Balance Sheet (có thể chọn nhiều file, mỗi style 1 file)",
@@ -118,8 +120,9 @@ TEXT = {
         "spinner": "Đang xử lý...",
         "process_error": "Đã xảy ra lỗi trong quá trình xử lý: {e}",
         "results_header": "Kết quả xử lý",
-        "result_ok": "Style {style}: đã ghi {lines} dòng (hàng {start}-{end}{added})",
+        "result_ok": "Style {style}: đã ghi {lines} dòng (hàng {start}-{end}{added}{preserved})",
         "rows_added_suffix": ", đã thêm {n} hàng",
+        "rows_preserved_suffix": ", giữ lại {n} dòng cũ phía dưới (không xóa)",
         "result_warn": "Style {style} ({sheet}): {status}",
         "status_no_style": "Không tìm thấy mã style trong Balance Sheet này",
         "status_no_trim_section": "Không tìm thấy phần GENERAL TRIM",
@@ -171,7 +174,9 @@ if fr_file is not None:
     try:
         fr_file.seek(0)
         probe_wb = openpyxl.load_workbook(io.BytesIO(fr_file.read()), read_only=True)
-        sheet_names = probe_wb.sheetnames
+        # hide this tool's own internal bookkeeping sheet (tracks which
+        # styles it has already claimed) from the sheet picker
+        sheet_names = [s for s in probe_wb.sheetnames if s != engine.META_SHEET_NAME]
         fr_file.seek(0)
         if len(sheet_names) == 1:
             fr_sheet_name = sheet_names[0]
@@ -218,9 +223,15 @@ if "results" in st.session_state:
         style = r.get("style", r.get("sheet"))
         if status == "ok":
             added = T["rows_added_suffix"].format(n=r["rows_added"]) if r.get("rows_added") else ""
+            preserved = (
+                T["rows_preserved_suffix"].format(n=r["rows_preserved"])
+                if r.get("preserved_existing") and r.get("rows_preserved")
+                else ""
+            )
             st.success(
                 T["result_ok"].format(
-                    style=style, lines=r["lines"], start=r["block_start"], end=r["block_end"], added=added
+                    style=style, lines=r["lines"], start=r["block_start"], end=r["block_end"],
+                    added=added, preserved=preserved,
                 )
             )
         else:

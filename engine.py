@@ -181,6 +181,40 @@ def insert_blank_row(ws, at_row):
         ws.merge_cells(start_row=nr[0], start_column=nr[1], end_row=nr[2], end_column=nr[3])
 
 
+def _extend_header_across_new_row(ws, above_row, new_row, exclude_cols):
+    """After a blank row has just been inserted at `new_row` (shifting
+    everything from there down by one), every OTHER column's own header
+    - everything except the trim field columns themselves, which get
+    their own labels written separately - would otherwise show a stray
+    blank cell where the new row landed, even though most of this sheet
+    already treats its header as spanning two rows (e.g. the STYLE NO
+    header's own existing 2-row merge). Re-merge whatever was sitting on
+    `above_row` (the row right above the new one) down across the new
+    row too, for every such column, so the sheet still reads as one
+    continuous header instead of a broken one with a gap row."""
+    thin = Side(style='thin', color='000000')
+    for c in range(1, ws.max_column + 1):
+        if c in exclude_cols:
+            continue
+        mc = find_merge_at(ws, above_row, c)
+        if mc:
+            if mc.max_row != above_row:
+                continue  # already extends past above_row somehow - leave it
+            fill = copy.copy(ws.cell(row=mc.min_row, column=mc.min_col).fill)
+            ws.unmerge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                              end_row=mc.max_row, end_column=mc.max_col)
+            ws.merge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                            end_row=new_row, end_column=mc.max_col)
+            for cc in range(mc.min_col, mc.max_col + 1):
+                ws.cell(row=new_row, column=cc).fill = fill
+            continue
+        v = ws.cell(row=above_row, column=c).value
+        if v is not None and str(v).strip() != "":
+            fill = copy.copy(ws.cell(row=above_row, column=c).fill)
+            ws.merge_cells(start_row=above_row, start_column=c, end_row=new_row, end_column=c)
+            ws.cell(row=new_row, column=c).fill = fill
+
+
 def ensure_dedicated_header_row(ws, style_col, label_row, field_cols):
     """Some FR charts have no row dedicated purely to the trim sub-column
     labels - the text that looks like a header ("ITEM/COLOR/...", "AWB#",
@@ -191,7 +225,10 @@ def ensure_dedicated_header_row(ws, style_col, label_row, field_cols):
     column headers at all. Detect that (label_row falls inside or at the
     start of the first style block) and, if so, insert one blank row
     right there so the labels get a permanent home of their own and
-    every style block's data shifts down by one row to make room.
+    every style block's data shifts down by one row to make room - and
+    extend every OTHER column's header across that new row too, so only
+    the trim grid actually gains an extra visible row; everywhere else
+    on the sheet keeps looking exactly as it did before.
     Returns True if a row was inserted."""
     blocks = enumerate_style_blocks(ws, style_col)
     if not blocks:
@@ -200,13 +237,15 @@ def ensure_dedicated_header_row(ws, style_col, label_row, field_cols):
     if label_row < first_start:
         return False  # already has a dedicated header row - nothing to do
 
+    above_row = label_row - 1
     insert_blank_row(ws, label_row)
+    _extend_header_across_new_row(ws, above_row, label_row, set(field_cols.values()))
 
     thin = Side(style='thin', color='000000')
     for field, col in field_cols.items():
         cc = ws.cell(row=label_row, column=col)
         cc.value = TRIM_FIELD_LABELS[field]
-        cc.font = Font(name="Calibri", size=12, bold=True)
+        cc.font = Font(name="Calibri", size=20, bold=True)
         cc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cc.border = Border(left=thin, right=thin, top=thin, bottom=thin)
     return True
@@ -360,32 +399,41 @@ def find_trim_section_layout(ws):
     return layout
 
 
+_EXCEL_ERRORS = {"#REF!", "#VALUE!", "#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!"}
+
+
 def _fmt_date(v):
+    """Only ever return a clean month/day for a genuine date value - a
+    Balance Sheet's ETD/ETA cell can have stray text typed into it by
+    mistake (a tracking note, "IN FAC", a broken formula's #REF! error),
+    and none of that is a date, so it's dropped rather than passed
+    through as-is."""
     if isinstance(v, datetime.datetime):
         return f"{v.month}/{v.day}"
-    if v is None or str(v).strip() == "":
-        return ""
-    return str(v)
+    if isinstance(v, datetime.date):
+        return f"{v.month}/{v.day}"
+    return ""
 
 
 def _clean(v):
     if v is None:
         return ""
-    return str(v).replace("\n", " ").strip()
+    s = str(v).replace("\n", " ").strip()
+    if s in _EXCEL_ERRORS:
+        return ""
+    return s
 
 
 def _fmt_qty(vals):
-    vals = [v for v in vals if v is not None]
-    if not vals:
+    """Sum only genuinely numeric values. A broken formula can leave a
+    quantity cell holding an error string (#REF!, #VALUE!, ...) instead
+    of a number - that and any other non-numeric stray text is dropped
+    entirely rather than carried into the output, since a quantity
+    field should only ever show a number."""
+    nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if not nums:
         return ""
-    nums = [v for v in vals if isinstance(v, (int, float))]
-    others = [v for v in vals if not isinstance(v, (int, float))]
-    parts = []
-    if nums:
-        parts.append(f"{sum(nums):,.0f}")
-    for o in others:
-        parts.append(str(o))
-    return " / ".join(parts) if parts else ""
+    return f"{sum(nums):,.0f}"
 
 
 def _has_value(v):
@@ -669,7 +717,9 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
     # overwritten by - that style's real data.
     blocks = enumerate_style_blocks(ws, style_col)
     if blocks and label_row >= blocks[0][1]:
+        above_row = label_row - 1
         insert_blank_row(ws, label_row)
+        _extend_header_across_new_row(ws, above_row, label_row, {trim_col})
 
     fb_fill = copy.copy(ws.cell(row=banner_row, column=trim_col).fill)
 
@@ -683,7 +733,7 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
         field_cols[field] = col
         cc = ws.cell(row=label_row, column=col)
         cc.value = TRIM_FIELD_LABELS[field]
-        cc.font = Font(name="Calibri", size=14, bold=True)
+        cc.font = Font(name="Calibri", size=20, bold=True)
         cc.fill = fb_fill
         cc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cc.border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -735,16 +785,25 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
     return field_cols
 
 
-def ensure_trim_fields(ws, label_row, trim_col, field_cols):
+def ensure_trim_fields(ws, banner_row, label_row, trim_col, field_cols):
     """Make sure every one of our 7 trim fields has a real column,
     inserting any that are missing (e.g. Qty Needed / Stock on a file
     that already has Item/Tracking/Shipped Qty/ETD/ETA from an earlier
-    template or tool run). Existing fields keep their current column -
-    never reordered, so no real data already in this sheet ever moves;
-    a missing field is appended right after the current right-most known
-    field. `label_row` is the row the existing field labels sit on
-    (find_fr_layout's label_row), passed in directly rather than
-    recomputed. Returns the completed field_cols (all 7 present)."""
+    template or tool run). Existing fields keep their current column at
+    this point - reorder_trim_fields (called separately, after this)
+    puts everything in the canonical order; a missing field is appended
+    right after the current right-most known field purely so there is
+    somewhere to put it before that reorder happens. `label_row` is the
+    row the existing field labels sit on (find_fr_layout's label_row),
+    passed in directly rather than recomputed. Every label - old and
+    newly appended alike - is set to one consistent font (size 20, bold)
+    so the grid doesn't end up a mix of whatever tiny font the original
+    legacy columns happened to use and the larger one this tool writes
+    for new ones. The banner directly above the labels (e.g. "TRIM
+    SCHEDULE") is widened to cover the full, final 7-column grid, since
+    its original width may only have covered the fields that already
+    existed before any were appended. Returns the completed field_cols
+    (all 7 present)."""
     field_cols = dict(field_cols)
     thin = Side(style='thin', color='000000')
     template_col = field_cols.get("item", trim_col)
@@ -762,13 +821,99 @@ def ensure_trim_fields(ws, label_row, trim_col, field_cols):
 
         cc = ws.cell(row=label_row, column=insert_at)
         cc.value = TRIM_FIELD_LABELS[field]
-        cc.font = copy.copy(template_cell.font)
         cc.fill = copy.copy(template_cell.fill)
         cc.alignment = copy.copy(template_cell.alignment)
         cc.border = Border(left=thin, right=thin, top=thin, bottom=thin)
         ws.column_dimensions[get_column_letter(insert_at)].width = 12
 
+    uniform_font = Font(name="Calibri", size=20, bold=True)
+    for col in field_cols.values():
+        ws.cell(row=label_row, column=col).font = uniform_font
+
+    grid_cols = sorted(field_cols.values())
+    first_col, last_col = grid_cols[0], grid_cols[-1]
+    bmc = find_merge_at(ws, banner_row, trim_col)
+    if bmc and bmc.max_col < last_col:
+        fill = copy.copy(ws.cell(row=bmc.min_row, column=bmc.min_col).fill)
+        value = ws.cell(row=bmc.min_row, column=bmc.min_col).value
+        font = copy.copy(ws.cell(row=bmc.min_row, column=bmc.min_col).font)
+        alignment = copy.copy(ws.cell(row=bmc.min_row, column=bmc.min_col).alignment)
+        ws.unmerge_cells(start_row=bmc.min_row, start_column=bmc.min_col,
+                          end_row=bmc.max_row, end_column=bmc.max_col)
+        ws.merge_cells(start_row=bmc.min_row, start_column=first_col,
+                        end_row=bmc.max_row, end_column=last_col)
+        anchor = ws.cell(row=bmc.min_row, column=first_col)
+        anchor.value = value
+        anchor.font = font
+        anchor.alignment = alignment
+        for cc in range(first_col, last_col + 1):
+            cell = ws.cell(row=bmc.min_row, column=cc)
+            cell.fill = fill
+            left = thin if cc == first_col else None
+            right = thin if cc == last_col else None
+            cell.border = Border(left=left, right=right, top=thin, bottom=thin)
+
     return field_cols
+
+
+def reorder_trim_fields(ws, field_cols, label_row):
+    """Put the 7 trim field columns in the canonical order the user
+    asked for (TRIM_FIELD_ORDER), regardless of what order they're
+    already sitting in - a column that pre-existed under a different
+    order (e.g. this tool's own earlier appended-at-the-end columns, or
+    a legacy template) gets physically moved, not just left where it
+    was. field_cols is always a contiguous block of 7 real columns by
+    this point, so this is a pure left-to-right permutation within that
+    same span: every row from `label_row` down to the sheet's last row
+    (every style's data, plus the label row itself) is read at the OLD
+    per-field column and rewritten at the NEW one. Any merge touching
+    this column band first has to go, since a reorder can't coexist
+    with cells merged across the columns being swapped - fill_style_
+    trim_grid and clean_and_divide_style_blocks both already re-merge
+    (or leave unmerged) whatever each row needs on their own next pass,
+    so this never leaves anything to clean up afterwards. Returns the
+    new field_cols (same columns, remapped to the right fields)."""
+    grid_cols = sorted(field_cols.values())
+    first_col, last_col = grid_cols[0], grid_cols[-1]
+    target = {field: first_col + i for i, field in enumerate(TRIM_FIELD_ORDER)}
+    if field_cols == target:
+        return field_cols
+
+    last_row = ws.max_row
+
+    for mc in list(ws.merged_cells.ranges):
+        if mc.max_row < label_row:
+            continue
+        if mc.max_col < first_col or mc.min_col > last_col:
+            continue
+        ws.unmerge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                          end_row=mc.max_row, end_column=mc.max_col)
+
+    snapshot = {}
+    for row in range(label_row, last_row + 1):
+        for field, col in field_cols.items():
+            c = ws.cell(row=row, column=col)
+            snapshot[(row, field)] = (c.value, copy.copy(c.font), copy.copy(c.fill),
+                                       copy.copy(c.border), copy.copy(c.alignment))
+
+    for row in range(label_row, last_row + 1):
+        for field, new_col in target.items():
+            value, font, fill, border, alignment = snapshot[(row, field)]
+            c = ws.cell(row=row, column=new_col)
+            c.value = value
+            c.font = font
+            c.fill = fill
+            c.border = border
+            c.alignment = alignment
+
+    old_widths = {field: ws.column_dimensions[get_column_letter(col)].width
+                  for field, col in field_cols.items()}
+    for field, new_col in target.items():
+        w = old_widths.get(field)
+        if w:
+            ws.column_dimensions[get_column_letter(new_col)].width = w
+
+    return target
 
 
 def enumerate_style_blocks(ws, style_col):
@@ -894,7 +1039,7 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
                                   top=existing.top, bottom=thin)
 
 
-def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, preserve_existing=False):
+def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, preserve_existing=False, prior_preserved_count=0):
     """Find the row block for `style_number` (freshly, since row positions
     may have shifted from earlier styles being grown) and write rows_out
     (a list of field->value dicts) into a bordered grid there, writing
@@ -908,8 +1053,11 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     written back right after the new rows_out, instead of being deleted
     - same columns, so it lines up with the new grid exactly, just
     pushed down. When False (the normal case once this tool has already
-    claimed the style), any old content there is fully replaced as
-    before, so repeated re-runs don't stack up forever."""
+    claimed the style), any NEW-DATA content there is fully replaced as
+    before, so repeated re-runs don't stack up forever - but
+    `prior_preserved_count`, if given, still carries forward that many
+    trailing rows verbatim (the legacy content captured on this style's
+    very first run), so it is never lost on a later, non-first run."""
     target_row = None
     for r in range(1, ws.max_row + 1):
         v = ws.cell(row=r, column=style_col).value
@@ -968,6 +1116,19 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
             if any_val:
                 preserved_rows.append(vals)
             rr = next_row
+    elif prior_preserved_count > 0:
+        # Not this style's first run, but an earlier run already moved
+        # some hand-typed legacy content down to the trailing rows of
+        # this block. That content must keep being carried forward on
+        # every later run too, not just captured once and then left to
+        # be overwritten - so read back exactly those trailing rows
+        # (as they stand right now, right before this run's new data
+        # and clearing pass would otherwise wipe them out) and treat
+        # them the same way a fresh capture would.
+        carry_start = max(start_row, end_row - prior_preserved_count + 1)
+        for rr in range(carry_start, end_row + 1):
+            vals = {field: ws.cell(row=rr, column=col).value for field, col in field_cols.items()}
+            preserved_rows.append(vals)
 
     n_needed = len(rows_out)
     total_needed = n_needed + len(preserved_rows)
@@ -1000,14 +1161,36 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     align = Alignment(horizontal='left', vertical='center', wrap_text=True)
 
     all_rows = list(rows_out) + preserved_rows
+    n_new = len(rows_out)
     for i, vals in enumerate(all_rows):
         rr = start_row + i
-        for field, col in field_cols.items():
-            c = ws.cell(row=rr, column=col)
-            c.value = vals.get(field, "")
+        is_preserved = i >= n_new
+        # A preserved row that only ever had ONE field's worth of real
+        # content (a single freeform note, not structured per-field
+        # data) reads much easier as one wide merged cell than squeezed
+        # into its original single column alongside 6 empty ones. A
+        # preserved row with several distinct field values (genuine
+        # structured data, e.g. an item name alongside its own ETD/ETA)
+        # keeps its normal one-field-per-column layout.
+        filled_fields = [f for f, v in vals.items() if v is not None and str(v).strip() != ""] if is_preserved else None
+        if is_preserved and len(filled_fields) <= 1:
+            for other in list(ws.merged_cells.ranges):
+                if other.min_row <= rr <= other.max_row and other.min_col <= grid_last_col and other.max_col >= grid_first_col:
+                    ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
+                                      end_row=other.max_row, end_column=other.max_col)
+            ws.merge_cells(start_row=rr, start_column=grid_first_col, end_row=rr, end_column=grid_last_col)
+            c = ws.cell(row=rr, column=grid_first_col)
+            c.value = vals.get(filled_fields[0], "") if filled_fields else ""
             c.border = border
             c.font = font
             c.alignment = align
+        else:
+            for field, col in field_cols.items():
+                c = ws.cell(row=rr, column=col)
+                c.value = vals.get(field, "")
+                c.border = border
+                c.font = font
+                c.alignment = align
         ws.row_dimensions[rr].height = 50
 
     # Clear any leftover rows below the newly written data within this
@@ -1032,12 +1215,16 @@ def get_or_create_meta_sheet(wb):
     this tool has already claimed (i.e. already written its own clean
     bordered grid for) in this FR workbook - never meant to be seen or
     edited by the user. Column A holds one claimed style number per
-    row. This is what tells a style's very first run (where any
-    pre-existing hand-typed trim notes must be preserved, not deleted)
+    row, column B holds how many preserved-legacy rows were written
+    below that style's grid the first time it was claimed. This is
+    what tells a style's very first run (where any pre-existing
+    hand-typed trim notes must be captured and preserved, not deleted)
     apart from a routine re-run (where this tool's own previous output
-    is simply replaced with the latest Balance Sheet numbers, as
-    before - otherwise every re-run would stack old output under new
-    output forever)."""
+    is simply replaced with the latest Balance Sheet numbers - except
+    for those already-preserved legacy rows, which must keep being
+    carried forward every single run from here on, never just the
+    first, or they'd be silently wiped the very next time this tool
+    runs)."""
     if META_SHEET_NAME in wb.sheetnames:
         return wb[META_SHEET_NAME]
     meta = wb.create_sheet(META_SHEET_NAME)
@@ -1057,13 +1244,31 @@ def is_style_claimed(meta_ws, style_number):
     return False
 
 
-def mark_style_claimed(meta_ws, style_number):
-    if is_style_claimed(meta_ws, style_number):
-        return
+def get_claimed_preserved_count(meta_ws, style_number):
+    """How many trailing rows of this style's grid are carried-forward
+    legacy content from before this tool ever touched it. 0 if the
+    style was never claimed, or was claimed with nothing to preserve."""
+    key = str(style_number).strip()
+    for row in meta_ws.iter_rows(min_col=1, max_col=2):
+        v = row[0].value
+        if v is not None and str(v).strip() == key:
+            n = row[1].value if len(row) > 1 else None
+            return int(n) if isinstance(n, (int, float)) else 0
+    return 0
+
+
+def mark_style_claimed(meta_ws, style_number, preserved_count=0):
+    key = str(style_number).strip()
+    for row in meta_ws.iter_rows(min_col=1, max_col=2):
+        v = row[0].value
+        if v is not None and str(v).strip() == key:
+            row[0].parent.cell(row=row[0].row, column=2, value=preserved_count)
+            return
     r = 1
     while meta_ws.cell(row=r, column=1).value is not None:
         r += 1
-    meta_ws.cell(row=r, column=1, value=str(style_number).strip())
+    meta_ws.cell(row=r, column=1, value=key)
+    meta_ws.cell(row=r, column=2, value=preserved_count)
 
 
 class EngineError(Exception):
@@ -1091,10 +1296,11 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         # setup_trim_grid_fresh handles its own version of the same
         # label-row/first-data-row collision internally (before writing
         # any labels), since here the 7 columns don't exist yet for
-        # ensure_dedicated_header_row to write into.
+        # ensure_dedicated_header_row to write into. It also always
+        # builds in canonical order, so no reorder is needed after.
         field_cols = setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col)
     else:
-        field_cols = ensure_trim_fields(ws, label_row, trim_col, field_cols)
+        field_cols = ensure_trim_fields(ws, banner_row, label_row, trim_col, field_cols)
         # Some already-expanded charts have no row dedicated purely to
         # these labels - the label text doubles as the first style's
         # first data row, because that is simply how the sheet was
@@ -1102,6 +1308,10 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         # written, otherwise the labels are destroyed on the very first
         # fill.
         ensure_dedicated_header_row(ws, style_col, label_row, field_cols)
+        # Whatever order the fields happened to already be in (a legacy
+        # template, or this tool's own earlier appended-at-the-end
+        # columns) gets physically moved into the canonical order here.
+        field_cols = reorder_trim_fields(ws, field_cols, label_row)
 
     meta_ws = get_or_create_meta_sheet(fr_wb)
 
@@ -1123,17 +1333,22 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         rows_out = extract_trim_rows(bs_ws, layout, split_keyword=split_keyword)
         # The very first time this tool ever claims a given style's trim
         # grid, anything already sitting there (hand-typed notes from
-        # before) is preserved below the new rows rather than deleted;
-        # once claimed, later re-runs go back to a plain replace so
-        # repeated processing doesn't stack up old output forever.
+        # before) is captured and preserved below the new rows rather
+        # than deleted; once claimed, later re-runs go back to a plain
+        # replace for the NEW-DATA rows so repeated processing doesn't
+        # stack up old output forever - but whatever got preserved on
+        # that first run keeps being carried forward on every run after
+        # it too, so it is never silently lost on a later re-run.
         first_time = not is_style_claimed(meta_ws, style_number)
+        prior_preserved = 0 if first_time else get_claimed_preserved_count(meta_ws, style_number)
         res = fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out,
-                                    preserve_existing=first_time)
+                                    preserve_existing=first_time,
+                                    prior_preserved_count=prior_preserved)
         if res is None:
             entry["status"] = "style_not_found_in_fr"
             results.append(entry)
             continue
-        mark_style_claimed(meta_ws, style_number)
+        mark_style_claimed(meta_ws, style_number, preserved_count=res.get("rows_preserved", 0))
         entry.update(res)
         entry["status"] = "ok"
         entry["lines"] = len(rows_out)

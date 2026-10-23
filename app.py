@@ -34,6 +34,9 @@ TEXT = {
 - 처음 처리되는 스타일의 경우, 기존에 있던 내용 중 **여러 항목에 값이 채워진 '구조화된' 데이터**(예: 수기로 번호 매겨 적어둔 리스트)는 새로 가져오는 데이터보다 **위쪽**에 각자 번호를 유지한 채 그대로 보존되고, **항목이 1개뿐인 자유 형식 메모**는 보기 편하게 7개 칸을 하나로 병합해서 맨 **아래**에 보존됩니다 (둘 다 삭제되지 않고, 새 데이터와 합쳐지지 않은 채 각각 따로 쌓입니다). 이렇게 보존된 내용은 이후 다시 처리해도 계속 유지됩니다.
 - 필요한 줄 수가 기존 스타일 블록의 행 수보다 많으면, 해당 스타일 블록 전체를 자동으로 늘리고 (다른 컬럼들의 병합, 수식, 아래 스타일들 위치도 같이 안전하게 조정) 부족한 만큼 채웁니다.
 - 헤더에 **BULK FB / TRIM** 그룹 제목과 구분선을 자동으로 넣습니다.
+- 스크롤을 내려도 TRIM SCHEDULE 배너(라벨 포함) 줄이 상단에 고정되도록 틀고정을 자동으로 설정합니다.
+- SKETCH처럼 셀에 직접 삽입된 사진(엑셀의 "셀에 그림 넣기" 기능)이 있으면 보존해서 그대로 가져옵니다.
+- TRIM 영역 오른쪽, 실제 내용이 없는 칸에 남아있는 지저분한 선이나 옛날 자료는 자동으로 깨끗하게 지웁니다.
 """,
         "split_keyword_label": "사이즈별로 줄을 나눌 항목 키워드 (기본: hangtag)",
         "step1_header": "1. Balance Sheet 업로드 (여러 개 선택 가능, 스타일당 1개)",
@@ -77,6 +80,9 @@ TEXT = {
 - The first time a style is ever processed: any **structured** content already there (multiple fields filled in, e.g. an existing hand-numbered list) is kept **above** the newly-pulled data, numbering intact; any **freeform** single-field note is merged across all 7 columns and kept at the **bottom** for readability. Neither is deleted, and neither is merged together with the new data - they're kept as separate stacked blocks. Both keep being carried forward on every later re-run too, so nothing is ever lost.
 - If more rows are needed than the style's current row block has, the whole block is safely grown (other merged columns, formulas, and the position of styles below are all adjusted automatically).
 - Header banners **BULK FB / TRIM** with a divider are set up automatically.
+- The TRIM SCHEDULE banner row (with its labels) is automatically frozen at the top, so it stays visible while scrolling down.
+- A picture inserted directly into a cell (Excel's "Picture in Cell" feature - e.g. a SKETCH swatch photo) is preserved and carried over as-is.
+- Any stray leftover border lines or old data sitting in genuinely unused columns to the right of the TRIM area are automatically wiped clean.
 """,
         "split_keyword_label": "Keyword for items to split by size (default: hangtag)",
         "step1_header": "1. Upload Balance Sheets (multiple allowed, one per style)",
@@ -120,6 +126,9 @@ TEXT = {
 - Lần đầu xử lý một style: nội dung **có cấu trúc** đã có từ trước (nhiều cột được điền, ví dụ danh sách đánh số viết tay) sẽ được giữ **ở trên**, vẫn giữ đúng số thứ tự cũ, phía trên dữ liệu mới lấy về; còn **ghi chú tự do** chỉ có 1 cột được điền sẽ được gộp vào 1 ô duy nhất và giữ ở **dưới cùng** cho dễ xem. Cả hai đều không bị xóa, và không bị gộp lẫn với dữ liệu mới - mỗi loại được xếp thành khối riêng. Cả hai tiếp tục được giữ lại ở những lần xử lý sau, không bao giờ bị mất.
 - Nếu số dòng cần nhiều hơn số hàng hiện có của khối style đó, toàn bộ khối sẽ được **tự động mở rộng** (các cột gộp khác, công thức, và vị trí của các style phía dưới đều được điều chỉnh an toàn).
 - Tiêu đề nhóm **BULK FB / TRIM** cùng đường phân cách sẽ được tự động thêm vào.
+- Dòng banner TRIM SCHEDULE (cùng các nhãn) sẽ được tự động đóng băng (freeze) ở trên cùng, để luôn hiển thị khi cuộn xuống.
+- Hình ảnh chèn trực tiếp vào ô (tính năng "Picture in Cell" của Excel, ví dụ ảnh SKETCH) sẽ được giữ nguyên và mang qua.
+- Các đường viền thừa hoặc dữ liệu cũ còn sót lại ở các cột trống thật sự bên phải khu vực TRIM sẽ được tự động xóa sạch.
 """,
         "split_keyword_label": "Từ khóa để tách dòng theo size (mặc định: hangtag)",
         "step1_header": "1. Tải lên Balance Sheet (có thể chọn nhiều file, mỗi style 1 file)",
@@ -205,7 +214,21 @@ if process_clicked:
     with st.spinner(T["spinner"]):
         try:
             fr_file.seek(0)
-            fr_wb = openpyxl.load_workbook(io.BytesIO(fr_file.read()))
+            original_bytes = fr_file.read()
+            fr_wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
+
+            # Some FR charts have a real photo (e.g. a SKETCH swatch)
+            # embedded directly in a cell via Excel's "Picture in Cell"
+            # feature - openpyxl has no support for this at all and
+            # silently drops every such picture the moment the workbook
+            # is saved back out. Captured here (which style owns which
+            # picture) BEFORE anything is touched, so it can be grafted
+            # back onto the final file afterwards - a complete no-op for
+            # any file that doesn't use this feature.
+            ws_pre = fr_wb[fr_sheet_name]
+            style_col_pre = engine.find_fr_layout(ws_pre)[0]
+            image_cells = engine.extract_richvalue_image_cells(original_bytes, fr_sheet_name)
+            image_owners = engine.resolve_image_style_owners(ws_pre, style_col_pre, image_cells)
 
             bs_wbs = []
             for f in bs_files:
@@ -216,9 +239,15 @@ if process_clicked:
 
             buf = io.BytesIO()
             fr_wb.save(buf)
-            buf.seek(0)
+            processed_bytes = buf.getvalue()
 
-            st.session_state["result_bytes"] = buf.getvalue()
+            if image_owners:
+                processed_bytes, _img_info = engine.graft_richvalue_images(
+                    original_bytes, processed_bytes, fr_sheet_name,
+                    image_owners, fr_wb[fr_sheet_name], style_col_pre,
+                )
+
+            st.session_state["result_bytes"] = processed_bytes
             st.session_state["results"] = results
             st.session_state["fr_filename"] = fr_file.name
         except engine.EngineError as e:

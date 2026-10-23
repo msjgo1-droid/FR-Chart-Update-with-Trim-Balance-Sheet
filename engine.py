@@ -35,9 +35,12 @@ Core rules (confirmed with the user, most recent version):
   whole sheet safely adjusted).
 """
 import re
+import io
 import json
 import copy
+import zipfile
 import datetime
+import xml.etree.ElementTree as ET
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 
@@ -977,6 +980,117 @@ def enumerate_style_blocks(ws, style_col):
     return blocks
 
 
+def clean_trailing_columns(ws, field_cols, banner_row, style_col):
+    """Wipes every column past the sheet's real content - stray leftover
+    border lines (and any messy old data) that have nothing to do with
+    the trim grid - so the area to the right of it is genuinely clean,
+    not just gridline-free - and normalizes whatever real, labeled
+    section sits directly next to the trim grid (e.g. a "TRIM TEST"
+    banner's own column) to a plain, fully-bordered look down every
+    data row, no matter how patchy or messy it came in.
+
+    Scans the banner row (and the row right below/above it, in case a
+    neighboring section's own label sits one row off from this tool's
+    own banner row) rightward from the trim grid for any text at all;
+    a label found there (e.g. "TRIM TEST") protects that column and
+    resets the search, so real sections are never touched - only a
+    genuinely empty run (no label text for several columns running)
+    marks where the sheet's real content actually ends.
+
+    Everything from the LAST labeled column onward is handled in two
+    ways:
+      - Every column after it (value, border, fill) is wiped clean
+        across every row, and any merged range reaching into that area
+        is unmerged, for the sheet's full current width - nothing
+        "real" should ever be out there.
+      - Every column from the grid's own right edge up through that
+        last labeled column (the neighboring section itself, e.g.
+        "TRIM TEST") is normalized per style block, not wiped, since
+        it's someone else's real section: a block whose rows there are
+        genuinely empty (no per-item test data of its own) is shown as
+        ONE clean cell merged across that style's whole row range, with
+        a full border - never a per-row patchwork, and always clearly
+        divided from the next style's own merged cell by a real border
+        line. A block that DOES have real per-row content in that
+        column keeps it as separate rows (never merged away), each one
+        just given a plain, uniform thin border instead of whatever
+        patchy mix of bordered/un-bordered rows column
+        insertion/row-growing elsewhere on the sheet may have left
+        behind - clean either way, regardless of how messy the input
+        file was.
+    """
+    grid_cols = sorted(field_cols.values())
+    last_col = grid_cols[-1]
+    scan_rows = sorted({banner_row, banner_row + 1, max(1, banner_row - 1)})
+
+    true_end = last_col
+    c = last_col + 1
+    blanks = 0
+    max_scan = min(ws.max_column, last_col + 60)
+    while c <= max_scan:
+        has_text = any(
+            ws.cell(row=r, column=c).value not in (None, "")
+            for r in scan_rows
+        )
+        if has_text:
+            true_end = c
+            blanks = 0
+        else:
+            blanks += 1
+            if blanks >= 3:
+                break
+        c += 1
+
+    blocks = enumerate_style_blocks(ws, style_col)
+    if blocks and true_end > last_col:
+        thin = Side(style='thin', color='000000')
+        uniform = Border(left=thin, right=thin, top=thin, bottom=thin)
+        for _style_value, start, end in blocks:
+            for cc in range(last_col + 1, true_end + 1):
+                cells = [ws.cell(row=r, column=cc) for r in range(start, end + 1)]
+                has_data = any(c.value not in (None, "") for c in cells)
+                if has_data or start == end:
+                    # Real per-row content here (e.g. a per-item test
+                    # result) must never be merged away - each row just
+                    # gets its own clean full border instead.
+                    for c in cells:
+                        c.border = uniform
+                    continue
+                # No real content anywhere in this style's rows for this
+                # column - shown as ONE clean merged cell per style
+                # (never per-row fragments), with a full border, so
+                # consecutive styles are always clearly divided from
+                # each other by a real border line, not just whitespace.
+                for mc in list(ws.merged_cells.ranges):
+                    if mc.min_row <= end and mc.max_row >= start \
+                            and mc.min_col <= cc <= mc.max_col:
+                        ws.unmerge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                                          end_row=mc.max_row, end_column=mc.max_col)
+                ws.merge_cells(start_row=start, start_column=cc, end_row=end, end_column=cc)
+                for c in cells:
+                    c.border = uniform
+
+    if true_end >= ws.max_column:
+        return
+
+    # Unmerge first - a cell inside a merged range other than its
+    # top-left anchor is a read-only MergedCell, so values can only be
+    # cleared safely once nothing in this band is merged any more.
+    for mc in list(ws.merged_cells.ranges):
+        if mc.max_col > true_end:
+            ws.unmerge_cells(start_row=mc.min_row, start_column=mc.min_col,
+                              end_row=mc.max_row, end_column=mc.max_col)
+
+    no_border = Border()
+    no_fill = PatternFill(fill_type=None)
+    for r in range(1, ws.max_row + 1):
+        for cc in range(true_end + 1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=cc)
+            cell.value = None
+            cell.border = no_border
+            cell.fill = no_fill
+
+
 def clean_and_divide_style_blocks(ws, style_col, field_cols):
     """Runs on every process() call (including re-runs on an already
     once-expanded file, so it also retroactively cleans up a live file the
@@ -1224,16 +1338,31 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
                    + [("freeform", v) for v in freeform_preserved])
     for i, (kind, vals) in enumerate(tagged_rows):
         rr = start_row + i
-        if kind == "freeform":
+        filled = [f for f, v in vals.items() if v is not None and str(v).strip() != ""]
+        # Whenever a row - whatever it is (a carried-forward freeform
+        # note, or just as often a plain NEW row straight out of the
+        # Balance Sheet whose own "item" cell already held one big
+        # hand-typed paragraph instead of real per-field values) - ends
+        # up with at most one field actually filled in, it's shown as
+        # ONE wide merged cell across the whole grid rather than
+        # dangling half-bordered in a single column with the other 6
+        # sitting empty next to it; a row with more than one field
+        # filled always keeps the normal per-field columns.
+        if len(filled) <= 1:
             for other in list(ws.merged_cells.ranges):
                 if other.min_row <= rr <= other.max_row and other.min_col <= grid_last_col and other.max_col >= grid_first_col:
                     ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
                                       end_row=other.max_row, end_column=other.max_col)
             ws.merge_cells(start_row=rr, start_column=grid_first_col, end_row=rr, end_column=grid_last_col)
-            filled = [f for f, v in vals.items() if v is not None and str(v).strip() != ""]
+            # A merged range's visible outline comes from EVERY cell it
+            # spans, not just the anchor - leaving the others at their
+            # prior (often blank/no-border) style would show as a
+            # top/bottom line only over the anchor's own width, with a
+            # gap for the rest of the merged box.
+            for col in range(grid_first_col, grid_last_col + 1):
+                ws.cell(row=rr, column=col).border = border
             c = ws.cell(row=rr, column=grid_first_col)
             c.value = vals.get(filled[0], "") if filled else ""
-            c.border = border
             c.font = font
             c.alignment = align
         else:
@@ -1381,6 +1510,302 @@ def load_fr_layout_from_meta(meta_ws, sheet_name):
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Excel "Picture in Cell" (rich-value) image preservation
+# ---------------------------------------------------------------------------
+# Recent Excel's "Insert Picture > Place in Cell" feature (used e.g. for a
+# SKETCH column showing a style's swatch photo right in the grid) stores the
+# picture as a rich-value object, referenced from the cell only via a `vm="N"`
+# attribute - openpyxl has no support for this at all, and silently drops
+# every such picture (plus the handful of workbook-level XML parts backing
+# it) the moment a workbook is loaded and saved through it. The cell's own
+# cached fallback value (what a non-rich-value-aware reader shows in place of
+# the picture, normally the literal text "#VALUE!") round-trips fine since
+# that part IS plain cell data - which is exactly why this used to look like
+# a pre-existing broken formula rather than an image this tool was dropping.
+#
+# These three functions restore them: capture which cells had one and which
+# style owned that row (before this tool moves anything), run the normal
+# openpyxl-based process() as usual, then graft the untouched image parts
+# from the ORIGINAL file's raw zip onto the processed file's raw zip, at
+# each owning style's new row - entirely outside openpyxl, which cannot
+# write any of this either. A file with no such pictures costs nothing extra
+# (extract_richvalue_image_cells returns [] immediately), so this is always
+# safe to run.
+
+_XML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_REL_DOC_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _richvalue_sheet_target(zf, sheet_name):
+    """Resolves a sheet name to its worksheet part path (e.g.
+    "xl/worksheets/sheet1.xml") inside an open zipfile.ZipFile, via
+    workbook.xml + workbook.xml.rels - never assumed from sheet order,
+    since that can differ between the original and processed files."""
+    wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+    rid = None
+    for sh in wb_xml.iter(f"{_XML_NS}sheet"):
+        if sh.get("name") == sheet_name:
+            rid = sh.get(f"{_REL_DOC_NS}id")
+            break
+    if rid is None:
+        return None
+    rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    for rel in rels_xml.iter(f"{_PKG_REL_NS}Relationship"):
+        if rel.get("Id") == rid:
+            target = (rel.get("Target") or "").lstrip("/")
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            return target
+    return None
+
+
+def extract_richvalue_image_cells(xlsx_bytes, sheet_name):
+    """Scans the RAW zip of an .xlsx (bytes) for cells using Excel's
+    'Picture in Cell' rich-value feature (a `vm="N"` attribute) on the
+    given sheet. Returns [] immediately if the file has no such feature
+    at all (the normal case), or a list of
+    {"row": int, "col": "D", "vm": int, "t": str|None, "v": str|None}
+    for each one found - t/v are that cell's own cached fallback
+    type/value (normally t="e", v="#VALUE!"), carried along so the
+    exact same fallback can be written back later."""
+    zf = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+    names = set(zf.namelist())
+    if "xl/richData/richValueRel.xml" not in names or "xl/metadata.xml" not in names:
+        return []
+    target = _richvalue_sheet_target(zf, sheet_name)
+    if not target or target not in names:
+        return []
+    sheet_xml = ET.fromstring(zf.read(target))
+    out = []
+    for c in sheet_xml.iter(f"{_XML_NS}c"):
+        vm = c.get("vm")
+        if not vm:
+            continue
+        ref = c.get("r") or ""
+        m = re.match(r"([A-Z]+)(\d+)", ref)
+        if not m:
+            continue
+        col, row = m.group(1), int(m.group(2))
+        v_el = c.find(f"{_XML_NS}v")
+        out.append({
+            "row": row, "col": col, "vm": int(vm),
+            "t": c.get("t"), "v": (v_el.text if v_el is not None else None),
+        })
+    return out
+
+
+def resolve_image_style_owners(ws, style_col, image_cells):
+    """Pairs each vm-image cell found by extract_richvalue_image_cells
+    with the style number that owned its row at capture time (read
+    straight from the still-unmodified worksheet) - this is what lets
+    the picture be re-attached to the right style's NEW row later, even
+    after other styles above it grow and shift everything below down."""
+    if not image_cells or style_col is None:
+        return []
+    owners = []
+    for cell in image_cells:
+        style_number = ws.cell(row=cell["row"], column=style_col).value
+        if style_number is None:
+            continue
+        o = dict(cell)
+        o["style_number"] = style_number
+        owners.append(o)
+    return owners
+
+
+def _col_letters_to_num(col):
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch) - ord('A') + 1)
+    return n
+
+
+def _graft_patch_cell_in_row(row_inner_xml, row_num, col, new_cell_xml):
+    """row_inner_xml is just the <c> children of one <row>. Replaces the
+    <c> at `col` if present, else splices new_cell_xml in at the right
+    column-order position."""
+    cell_pattern = re.compile(r'<c r="([A-Z]+)' + str(row_num) + r'"[^>]*?(?:/>|>.*?</c>)', re.DOTALL)
+    cells = list(cell_pattern.finditer(row_inner_xml))
+    target_col_num = _col_letters_to_num(col)
+    for m in cells:
+        if m.group(1) == col:
+            return row_inner_xml[:m.start()] + new_cell_xml + row_inner_xml[m.end():]
+    insert_at = len(row_inner_xml)
+    for m in cells:
+        if _col_letters_to_num(m.group(1)) > target_col_num:
+            insert_at = m.start()
+            break
+    return row_inner_xml[:insert_at] + new_cell_xml + row_inner_xml[insert_at:]
+
+
+def _graft_patch_worksheet_xml(sheet_xml_str, placements):
+    """placements: [{row, col, vm, t, v}, ...]. Returns (patched_xml,
+    failed) where failed lists any (row, col) whose <row> element could
+    not be found at all (should not normally happen)."""
+    failed = []
+    for p in placements:
+        row_num = p["row"]
+        row_pattern = re.compile(r'(<row r="' + str(row_num) + r'"[^>]*>)(.*?)(</row>)', re.DOTALL)
+        m = row_pattern.search(sheet_xml_str)
+        if not m:
+            failed.append((row_num, p["col"]))
+            continue
+        existing_s = None
+        head_search = re.search(r'<c r="' + p["col"] + str(row_num) + r'"([^>]*)(?:/>|>)', m.group(2))
+        if head_search:
+            s_attr_m = re.search(r's="(\d+)"', head_search.group(1))
+            if s_attr_m:
+                existing_s = s_attr_m.group(1)
+        s_part = f' s="{existing_s}"' if existing_s is not None else ""
+        v_text = p["v"] if p["v"] is not None else "#VALUE!"
+        t_attr = p["t"] or "e"
+        new_cell = f'<c r="{p["col"]}{row_num}"{s_part} t="{t_attr}" vm="{p["vm"]}"><v>{v_text}</v></c>'
+        new_inner = _graft_patch_cell_in_row(m.group(2), row_num, p["col"], new_cell)
+        sheet_xml_str = (sheet_xml_str[:m.start()] + m.group(1) + new_inner
+                          + m.group(3) + sheet_xml_str[m.end():])
+    return sheet_xml_str, failed
+
+
+def graft_richvalue_images(original_bytes, processed_bytes, sheet_name, owners, ws_after, style_col):
+    """Re-attaches the 'Picture in Cell' images extract_richvalue_image_cells
+    found in the ORIGINAL file (and openpyxl silently dropped on save)
+    onto `processed_bytes`, at each owning style's new row (found by
+    scanning `ws_after`, the already fully-processed worksheet, for that
+    style number). Copies the untouched richData/media/metadata parts
+    straight from the original zip and wires up the handful of
+    references Excel needs for them (Content_Types, workbook
+    relationships, and the `vm` attribute on each target cell) that
+    openpyxl cannot write at all. Returns (final_bytes, info) where info
+    is {"restored": n, "failed": [...]}; a no-op (returns processed_bytes
+    unchanged) when there was nothing to restore."""
+    if not owners:
+        return processed_bytes, {"restored": 0, "failed": []}
+
+    new_rows = {}
+    for o in owners:
+        sn = o["style_number"]
+        if sn in new_rows:
+            continue
+        for r in range(1, ws_after.max_row + 1):
+            if ws_after.cell(row=r, column=style_col).value == sn:
+                new_rows[sn] = r
+                break
+
+    placements = []
+    skipped = []
+    for o in owners:
+        sn = o["style_number"]
+        if sn not in new_rows:
+            skipped.append((None, o["col"]))
+            continue
+        placements.append({
+            "row": new_rows[sn], "col": o["col"], "vm": o["vm"],
+            "t": o["t"], "v": o["v"],
+        })
+
+    orig_zip = zipfile.ZipFile(io.BytesIO(original_bytes))
+    orig_names = set(orig_zip.namelist())
+
+    richdata_parts = sorted(n for n in orig_names if n.startswith("xl/richData/"))
+    media_parts = set()
+    rels_name = "xl/richData/_rels/richValueRel.xml.rels"
+    if rels_name in orig_names:
+        rels_xml = ET.fromstring(orig_zip.read(rels_name))
+        for rel in rels_xml.iter(f"{_PKG_REL_NS}Relationship"):
+            tgt = (rel.get("Target") or "").replace("../", "")
+            if not tgt.startswith("xl/"):
+                tgt = "xl/" + tgt
+            media_parts.add(tgt)
+
+    parts_to_copy = [p for p in (richdata_parts + sorted(media_parts) + ["xl/metadata.xml"])
+                      if p in orig_names]
+
+    proc_zip_in = zipfile.ZipFile(io.BytesIO(processed_bytes))
+    proc_names = set(proc_zip_in.namelist())
+
+    # ---- [Content_Types].xml ----
+    ct_xml = proc_zip_in.read("[Content_Types].xml").decode("utf-8")
+    orig_ct_xml = orig_zip.read("[Content_Types].xml").decode("utf-8")
+    ct_additions = []
+    if 'Extension="png"' not in ct_xml:
+        ct_additions.append('<Default Extension="png" ContentType="image/png"/>')
+    for part in parts_to_copy:
+        if part.startswith("xl/media/"):
+            continue  # covered by the Default png entry above
+        part_name = "/" + part
+        if f'PartName="{part_name}"' in ct_xml:
+            continue
+        m = re.search(r'<Override PartName="' + re.escape(part_name) + r'"[^/]*/>', orig_ct_xml)
+        if m:
+            ct_additions.append(m.group(0))
+    if ct_additions:
+        ct_xml = ct_xml.replace("</Types>", "".join(ct_additions) + "</Types>")
+
+    # ---- xl/_rels/workbook.xml.rels ----
+    rels_xml_str = proc_zip_in.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    orig_rels_xml = orig_zip.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    existing_ids = set(re.findall(r'Id="(rId\d+)"', rels_xml_str))
+    existing_targets = set(re.findall(r'Target="([^"]+)"', rels_xml_str))
+    next_id_num = 1
+    while f"rId{next_id_num}" in existing_ids:
+        next_id_num += 1
+
+    rel_additions = []
+    for part in parts_to_copy:
+        if part == "xl/metadata.xml":
+            target = "metadata.xml"
+        elif part.startswith("xl/richData/"):
+            target = part[len("xl/"):]
+        else:
+            continue  # media isn't referenced at the workbook-rel level
+        if target in existing_targets:
+            continue
+        rtype_m = re.search(r'<Relationship Id="rId\d+" Type="([^"]+)" Target="'
+                             + re.escape(target) + r'"/>', orig_rels_xml)
+        if not rtype_m:
+            continue
+        new_id = f"rId{next_id_num}"
+        next_id_num += 1
+        while f"rId{next_id_num}" in existing_ids:
+            next_id_num += 1
+        existing_ids.add(new_id)
+        existing_targets.add(target)
+        rel_additions.append(f'<Relationship Id="{new_id}" Type="{rtype_m.group(1)}" Target="{target}"/>')
+    if rel_additions:
+        rels_xml_str = rels_xml_str.replace("</Relationships>", "".join(rel_additions) + "</Relationships>")
+
+    # ---- worksheet xml ----
+    ws_target = _richvalue_sheet_target(zipfile.ZipFile(io.BytesIO(processed_bytes)), sheet_name)
+    if ws_target and ws_target in proc_names:
+        ws_xml_str = proc_zip_in.read(ws_target).decode("utf-8")
+        ws_xml_str, patch_failed = _graft_patch_worksheet_xml(ws_xml_str, placements)
+    else:
+        ws_xml_str = None
+        patch_failed = [(p["row"], p["col"]) for p in placements]
+
+    # ---- rebuild zip ----
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in proc_zip_in.infolist():
+            data = proc_zip_in.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = ct_xml.encode("utf-8")
+            elif item.filename == "xl/_rels/workbook.xml.rels":
+                data = rels_xml_str.encode("utf-8")
+            elif ws_xml_str is not None and item.filename == ws_target:
+                data = ws_xml_str.encode("utf-8")
+            zout.writestr(item, data)
+        for part in parts_to_copy:
+            if part in proc_names:
+                continue
+            zout.writestr(part, orig_zip.read(part))
+
+    info = {"restored": len(placements) - len(patch_failed), "failed": patch_failed + skipped}
+    return out_buf.getvalue(), info
+
+
 class EngineError(Exception):
     """Raised with a status code (not a human message) so the caller (the
     Streamlit app) can localize it."""
@@ -1474,6 +1899,12 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
     # retroactively cleans up styles left over from earlier runs.
     clean_and_divide_style_blocks(ws, style_col, field_cols)
 
+    # Real leftover border fragments (not just Excel's default gridline
+    # display) past the sheet's actual content - e.g. a neighboring
+    # section's own column losing its border on rows that got freshly
+    # inserted during a block growth - are wiped here, every run.
+    clean_trailing_columns(ws, field_cols, banner_row, style_col)
+
     # The "messy from column X onward" look the user sees is not actual
     # cell formatting at all - it is Excel's own default gridline display
     # over the sheet's genuinely empty area beyond its real used range (no
@@ -1484,5 +1915,13 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
     # heavily-styled chart) looking exactly the same, since explicit
     # borders/fills render independently of this view setting.
     ws.sheet_view.showGridLines = False
+
+    # Freezes everything from the banner row up (the combined TRIM
+    # SCHEDULE banner + its 7 field labels, all in one row/cell) so it
+    # stays visible at the top while scrolling down through every
+    # style's rows below it - only the rows are frozen, not any
+    # columns, since that's the part the user actually asked to keep
+    # fixed in view.
+    ws.freeze_panes = ws.cell(row=banner_row + 1, column=1).coordinate
 
     return results

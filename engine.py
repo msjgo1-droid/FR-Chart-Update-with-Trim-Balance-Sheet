@@ -44,6 +44,13 @@ import xml.etree.ElementTree as ET
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 
+# Bumped on every real behavior change, shown in the app's own UI
+# (app.py) so it's possible to tell at a glance whether a deployed
+# Streamlit app is actually running this exact copy of engine.py, or an
+# older one left over from before a replaced file - a mismatch here has
+# been the cause of several rounds of "I already fixed that" confusion.
+ENGINE_VERSION = "2026-10-23.5"
+
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
 # Canonical order for a freshly-built TRIM grid, and the label written for
@@ -219,43 +226,66 @@ def _extend_header_across_new_row(ws, above_row, new_row, exclude_cols):
             ws.cell(row=new_row, column=c).fill = fill
 
 
-def write_trim_banner_label(ws, banner_row, field_cols):
-    """Writes the 7 field names directly into the trim banner cell itself
-    (e.g. "TRIM SCHEDULE"), as a second line below the banner's own text,
-    inside the SAME merged cell - rather than a separate row underneath
-    for just the labels. A separate row meant every OTHER column's own
-    header had to be stretched to cover it too, which is exactly the
-    "messy, extra blank-looking row" the chart doesn't need: with no
-    extra row ever inserted here, the whole header area - trim columns
-    and every other column alike - stays exactly the height it always
-    was, and the very first data row (for whichever style starts here,
-    including any of its own already-existing hand-typed trim content)
-    sits right below the banner, undisturbed.
+def write_trim_banner_label(ws, banner_row, label_row, field_cols):
+    """Rebuilds the trim header as TWO separate rows, as originally laid
+    out in the chart: the banner text (e.g. "TRIM SCHEDULE") stays alone
+    on `banner_row`, and the 7 field names are written as their own
+    individual, bordered sub-column labels on `label_row` right below it
+    - matching every other section's own two-row header style on this
+    sheet (a banner row, then a label row). `label_row` is never used
+    for a style's own data; fill_style_trim_grid always starts a style's
+    actual trim rows at label_row + 1, the same way the sheet's other
+    sections leave their own label row clear of data.
     By this point ensure_trim_fields has already widened the banner's
-    own merge to span the full, final field_cols range, so this only
-    changes what text that merge shows."""
+    own merge to span the full, final field_cols range."""
     grid_cols = sorted(field_cols.values())
     first_col, last_col = grid_cols[0], grid_cols[-1]
+    thin = Side(style='thin', color='000000')
+
     mc = find_merge_at(ws, banner_row, first_col)
     anchor_row = mc.min_row if mc else banner_row
     anchor_col = mc.min_col if mc else first_col
     cell = ws.cell(row=anchor_row, column=anchor_col)
     existing = str(cell.value).split("\n")[0].strip() if cell.value else "TRIM SCHEDULE"
-    label_line = " | ".join(TRIM_FIELD_LABELS[f] for f in TRIM_FIELD_ORDER)
-    cell.value = f"{existing}\n{label_line}"
+    cell.value = existing
     cell.font = Font(name="Calibri", size=20, bold=True)
     cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-
-    thin = Side(style='thin', color='000000')
+    banner_fill = copy.copy(cell.fill)
     for cc in range(first_col, last_col + 1):
         c2 = ws.cell(row=anchor_row, column=cc)
         c2.border = Border(left=thin if cc == first_col else None,
                             right=thin if cc == last_col else None,
                             top=thin, bottom=thin)
+        c2.fill = banner_fill
 
-    current_h = ws.row_dimensions[anchor_row].height
-    if current_h is None or current_h < 55:
-        ws.row_dimensions[anchor_row].height = 55
+    # label_row may itself be covered by a leftover merge (e.g. an
+    # earlier run's combined banner+label cell spanning down into it, or
+    # a stray merge from the original template) - break any of those
+    # apart first so each of the 7 label cells can be written and
+    # bordered individually.
+    for other in list(ws.merged_cells.ranges):
+        if other.min_row <= label_row <= other.max_row \
+                and other.max_col >= first_col and other.min_col <= last_col:
+            ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
+                              end_row=other.max_row, end_column=other.max_col)
+
+    # Same fill as the banner directly above, and the same large font
+    # size used everywhere else on this chart, so the labels read
+    # clearly instead of disappearing as small dark text on a plain
+    # white background.
+    for field in TRIM_FIELD_ORDER:
+        col = field_cols[field]
+        c = ws.cell(row=label_row, column=col)
+        c.value = TRIM_FIELD_LABELS[field]
+        c.font = Font(name="Calibri", size=20, bold=True)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        c.fill = banner_fill
+
+    if ws.row_dimensions[anchor_row].height is None or ws.row_dimensions[anchor_row].height < 40:
+        ws.row_dimensions[anchor_row].height = 40
+    if ws.row_dimensions[label_row].height is None or ws.row_dimensions[label_row].height < 55:
+        ws.row_dimensions[label_row].height = 55
 
 
 def safe_insert_cols(ws, insert_at_col, amount):
@@ -698,16 +728,15 @@ def find_fr_layout(ws, meta_ws=None):
     the row right after it.
 
     `meta_ws` (optional) is this workbook's hidden `_frtrim_meta` sheet.
-    The 7 field labels now live only as a second line inside the banner
-    cell itself (write_trim_banner_label), not as their own per-column
-    header text, so a plain text-scan can no longer reliably tell an
-    already-expanded grid apart from a brand-new one on a file that has
-    no other coincidental header-like text sitting in that row. When the
-    text-scan below comes back empty, this falls back to whatever
-    field_cols layout this tool last saved for this exact sheet name in
-    meta_ws (process() saves it after every run) - but only as a
-    fallback, so a genuine fresh file (nothing saved yet) still correctly
-    falls through to building a brand-new grid.
+    The 7 field labels are written as their own per-column header text on
+    `label_row` (write_trim_banner_label), so the text-scan below is
+    normally all that's needed to tell an already-expanded grid apart
+    from a brand-new one. When it still comes back empty (an edge case,
+    e.g. a file whose label row text was altered by hand), this falls
+    back to whatever field_cols layout this tool last saved for this
+    exact sheet name in meta_ws (process() saves it after every run) -
+    but only as a fallback, so a genuine fresh file (nothing saved yet)
+    still correctly falls through to building a brand-new grid.
     """
     style_col = None
     for c in range(1, min(60, ws.max_column) + 1):
@@ -777,11 +806,9 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
     canonical order, and (re)build the BULK FB / TRIM header banners with
     a divider border. `banner_row` is the row the original single "TRIM"
     banner text sits on (rebuilt here as two bits, "BULK FB" + "TRIM").
-    No separate row is ever used for the field sub-labels - the caller
-    writes those into this same banner cell afterward
-    (write_trim_banner_label) - so data for whichever style starts right
-    after the banner (at `label_row`, including any of its own
-    already-existing hand-typed content) is never disturbed here.
+    The caller writes the 7 field sub-labels into `label_row` afterward
+    (write_trim_banner_label); this function only builds the column grid
+    and the banner row itself.
     Returns field_cols: {field: column}."""
     fb_fill = copy.copy(ws.cell(row=banner_row, column=trim_col).fill)
 
@@ -848,11 +875,10 @@ def ensure_trim_fields(ws, banner_row, label_row, trim_col, field_cols):
     this point - reorder_trim_fields (called separately, after this)
     puts everything in the canonical order; a missing field is appended
     right after the current right-most known field purely so there is
-    somewhere to put it before that reorder happens. `label_row` is the
-    row this style data would otherwise start on (find_fr_layout's
-    label_row) - no label text is written there any more (that all
-    lives in the banner cell itself now, via write_trim_banner_label),
-    this is only used to size the newly-inserted columns' width. The
+    somewhere to put it before that reorder happens. `label_row` is used
+    here only to size the newly-inserted columns' width (the caller
+    writes the actual label text there afterward, via
+    write_trim_banner_label). The
     banner directly above (e.g. "TRIM SCHEDULE") is widened to cover
     the full, final 7-column grid, since its original width may only
     have covered the fields that already existed before any were
@@ -1091,6 +1117,88 @@ def clean_trailing_columns(ws, field_cols, banner_row, style_col):
             cell.fill = no_fill
 
 
+def _merge_sparse_trim_rows(ws, field_cols, start, end):
+    """For a single style block's trim-grid rows (start..end), every
+    CONSECUTIVE run of rows that each have at most one of the 7 fields
+    actually filled in - old hand-typed freeform text, most often, one
+    line per row - is merged together into a SINGLE wide, bordered cell
+    for the whole run (their text stacked with line breaks), not one
+    merged cell per row: a run of 7 such rows becomes 1 merged cell, not
+    7. Runs for EVERY style block (see clean_and_divide_style_blocks),
+    including ones this run's Balance Sheets never touched, so legacy
+    freeform notes elsewhere on the sheet get the same clean treatment.
+    A row genuinely blank across every field is left exactly as it was.
+
+    Also re-consolidates a run of several already-separate 1-row merges
+    left over from an older run of this tool (back when each such row
+    got its own individual merge instead of being combined) - an
+    existing full-width merge is treated as one indivisible unit of
+    however many rows it already spans, and adjacent sparse units (merged
+    or not) are combined together the same way plain unmerged rows are."""
+    grid_cols = sorted(field_cols.values())
+    grid_first_col, grid_last_col = grid_cols[0], grid_cols[-1]
+    thin = Side(style='thin', color='000000')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    font = Font(name='Calibri', size=20)
+    align = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+    units = []
+    rr = start
+    while rr <= end:
+        full_merge = None
+        for mc in ws.merged_cells.ranges:
+            if mc.min_row <= rr <= mc.max_row and mc.min_col <= grid_first_col and mc.max_col >= grid_last_col:
+                full_merge = mc
+                break
+        if full_merge is not None:
+            text = ws.cell(row=full_merge.min_row, column=grid_first_col).value
+            text = str(text).strip() if text not in (None, "") else ""
+            units.append({"start": full_merge.min_row, "end": min(full_merge.max_row, end), "text": text})
+            rr = full_merge.max_row + 1
+            continue
+
+        filled = [(f, ws.cell(row=rr, column=col).value) for f, col in field_cols.items()]
+        filled = [(f, v) for f, v in filled if v is not None and str(v).strip() != ""]
+        if len(filled) <= 1:
+            units.append({"start": rr, "end": rr, "text": str(filled[0][1]) if filled else ""})
+        else:
+            units.append({"start": rr, "end": rr, "text": None})  # structured row: a hard boundary
+        rr += 1
+
+    i = 0
+    n = len(units)
+    while i < n:
+        if units[i]["text"] is None:
+            i += 1
+            continue
+        run_start_i = i
+        texts = []
+        while i < n and units[i]["text"] is not None:
+            if units[i]["text"]:
+                texts.append(units[i]["text"])
+            i += 1
+        rr_start = units[run_start_i]["start"]
+        rr_end = units[i - 1]["end"]
+        if not texts:
+            continue  # the whole run is genuinely blank - leave it untouched
+
+        for other in list(ws.merged_cells.ranges):
+            if other.min_row <= rr_end and other.max_row >= rr_start \
+                    and other.min_col <= grid_last_col and other.max_col >= grid_first_col:
+                ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
+                                  end_row=other.max_row, end_column=other.max_col)
+        ws.merge_cells(start_row=rr_start, start_column=grid_first_col, end_row=rr_end, end_column=grid_last_col)
+        for col in range(grid_first_col, grid_last_col + 1):
+            for rr2 in range(rr_start, rr_end + 1):
+                ws.cell(row=rr2, column=col).border = border
+        c = ws.cell(row=rr_start, column=grid_first_col)
+        c.value = "\n".join(texts)
+        c.font = font
+        c.alignment = align
+        for rr2 in range(rr_start, rr_end + 1):
+            ws.row_dimensions[rr2].height = max(ws.row_dimensions[rr2].height or 0, 50)
+
+
 def clean_and_divide_style_blocks(ws, style_col, field_cols):
     """Runs on every process() call (including re-runs on an already
     once-expanded file, so it also retroactively cleans up a live file the
@@ -1115,8 +1223,14 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
         Sheet) has that merge widened across the full grid width and its
         borders cleared too, so it renders as one clean blank cell instead
         of a messy leftover grid.
-      - A style block that HAS been filled (fill_style_trim_grid already
-        unmerged it and wrote a clean bordered grid) is left as-is.
+      - A style block that HAS been filled runs the same "merge any row
+        with at most one field filled into one wide bordered cell" pass
+        fill_style_trim_grid itself applies - but here it runs for EVERY
+        style block on the sheet, not only the ones this particular run's
+        Balance Sheets happened to touch. That is what cleans up a style
+        whose trim data is old hand-typed freeform text left over from
+        before this tool ever processed it, sitting untouched in one
+        column with the rest of that row blank.
       - Every block, filled or not, gets a permanent vertical divider line
         right after its own grid, on every row - plus a bottom-border
         divider at its last row spanning from the grid's first column to
@@ -1174,6 +1288,8 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
             for rr in range(start, end + 1):
                 for cc in range(trim_col, grid_last_col + 1):
                     ws.cell(row=rr, column=cc).border = no_border
+        else:
+            _merge_sparse_trim_rows(ws, field_cols, start, end)
 
         # Permanent divider right after our own grid, on every row of the
         # block (independent of whatever the original file's own
@@ -1191,7 +1307,7 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
                                   top=existing.top, bottom=thin)
 
 
-def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, preserve_existing=False, prior_structured_count=0, prior_freeform_count=0):
+def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, preserve_existing=False, prior_structured_count=0, prior_freeform_count=0, label_row=None):
     """Find the row block for `style_number` (freshly, since row positions
     may have shifted from earlier styles being grown) and write rows_out
     (a list of field->value dicts) into a bordered grid there, writing
@@ -1208,7 +1324,15 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     are replaced, so repeated re-runs don't stack up forever - but
     `prior_structured_count` / `prior_freeform_count`, if given, still
     carry forward those rows from their own correct ends of the block,
-    so neither is ever lost on a later, non-first run."""
+    so neither is ever lost on a later, non-first run.
+
+    `label_row`: the dedicated trim-field-label row written by
+    write_trim_banner_label. Only the style block that starts right
+    under the header (its own start_row at or above label_row) is ever
+    affected - the grid for that one style is clamped to begin at
+    label_row + 1 so it never overwrites the label row itself; every
+    later style block further down the sheet already starts well below
+    label_row and is untouched by this."""
     target_row = None
     for r in range(1, ws.max_row + 1):
         v = ws.cell(row=r, column=style_col).value
@@ -1233,6 +1357,19 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
         start_row, end_row = style_mc.min_row, style_mc.max_row
     else:
         start_row = end_row = target_row
+
+    # block_start_row keeps the STYLE column's own true, unclamped block
+    # start - this is what grow_block_insert_rows must be given below so
+    # it can find and widen the OTHER (non-trim) columns' own merges for
+    # this block, which still start there. start_row itself may get
+    # pulled down past label_row right after this (for the trim grid's
+    # own writing only) - using the clamped value instead here would
+    # make every other column's merge silently stop matching and never
+    # grow with the block.
+    block_start_row = start_row
+
+    if label_row is not None and start_row <= label_row:
+        start_row = label_row + 1
 
     # Pre-existing content here isn't always 7 separate per-field values
     # - it can be a single note merged across several rows AND several
@@ -1303,7 +1440,7 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     added_rows = 0
     if total_needed > available:
         shortfall = total_needed - available
-        grow_block_insert_rows(ws, start_row, end_row, shortfall)
+        grow_block_insert_rows(ws, block_start_row, end_row, shortfall)
         end_row += shortfall
         added_rows = shortfall
 
@@ -1336,43 +1473,67 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     tagged_rows = ([("structured", v) for v in structured_preserved]
                    + [("new", v) for v in rows_out]
                    + [("freeform", v) for v in freeform_preserved])
-    for i, (kind, vals) in enumerate(tagged_rows):
-        rr = start_row + i
+
+    # Whenever a row - whatever it is (a carried-forward freeform note,
+    # or just as often a plain NEW row straight out of the Balance Sheet
+    # whose own "item" cell already held one big hand-typed paragraph
+    # instead of real per-field values) - ends up with at most one field
+    # actually filled in, it does not get its own separate 1-row merge:
+    # the WHOLE run of consecutive such rows is merged together into ONE
+    # wide cell (their text stacked with line breaks), exactly as that
+    # text originally sat in a single cell before. A run of 7 such rows
+    # becomes 1 merged cell, not 7; an isolated single one still becomes
+    # its own (1-row) merged cell the same way. A row with more than one
+    # field filled always breaks the run and keeps its normal per-field
+    # columns.
+    i = 0
+    n = len(tagged_rows)
+    while i < n:
+        _, vals = tagged_rows[i]
         filled = [f for f, v in vals.items() if v is not None and str(v).strip() != ""]
-        # Whenever a row - whatever it is (a carried-forward freeform
-        # note, or just as often a plain NEW row straight out of the
-        # Balance Sheet whose own "item" cell already held one big
-        # hand-typed paragraph instead of real per-field values) - ends
-        # up with at most one field actually filled in, it's shown as
-        # ONE wide merged cell across the whole grid rather than
-        # dangling half-bordered in a single column with the other 6
-        # sitting empty next to it; a row with more than one field
-        # filled always keeps the normal per-field columns.
         if len(filled) <= 1:
+            run_start_i = i
+            texts = []
+            while i < n:
+                _, rvals = tagged_rows[i]
+                rfilled = [f for f, v in rvals.items() if v is not None and str(v).strip() != ""]
+                if len(rfilled) > 1:
+                    break
+                if rfilled:
+                    texts.append(str(rvals[rfilled[0]]))
+                i += 1
+            rr_start = start_row + run_start_i
+            rr_end = start_row + (i - 1)
             for other in list(ws.merged_cells.ranges):
-                if other.min_row <= rr <= other.max_row and other.min_col <= grid_last_col and other.max_col >= grid_first_col:
+                if other.min_row <= rr_end and other.max_row >= rr_start \
+                        and other.min_col <= grid_last_col and other.max_col >= grid_first_col:
                     ws.unmerge_cells(start_row=other.min_row, start_column=other.min_col,
                                       end_row=other.max_row, end_column=other.max_col)
-            ws.merge_cells(start_row=rr, start_column=grid_first_col, end_row=rr, end_column=grid_last_col)
+            ws.merge_cells(start_row=rr_start, start_column=grid_first_col, end_row=rr_end, end_column=grid_last_col)
             # A merged range's visible outline comes from EVERY cell it
             # spans, not just the anchor - leaving the others at their
             # prior (often blank/no-border) style would show as a
             # top/bottom line only over the anchor's own width, with a
             # gap for the rest of the merged box.
             for col in range(grid_first_col, grid_last_col + 1):
-                ws.cell(row=rr, column=col).border = border
-            c = ws.cell(row=rr, column=grid_first_col)
-            c.value = vals.get(filled[0], "") if filled else ""
+                for rr in range(rr_start, rr_end + 1):
+                    ws.cell(row=rr, column=col).border = border
+            c = ws.cell(row=rr_start, column=grid_first_col)
+            c.value = "\n".join(texts)
             c.font = font
             c.alignment = align
+            for rr in range(rr_start, rr_end + 1):
+                ws.row_dimensions[rr].height = 50
         else:
+            rr = start_row + i
             for field, col in field_cols.items():
                 c = ws.cell(row=rr, column=col)
                 c.value = vals.get(field, "")
                 c.border = border
                 c.font = font
                 c.alignment = align
-        ws.row_dimensions[rr].height = 50
+            ws.row_dimensions[rr].height = 50
+            i += 1
 
     # Clear any leftover rows below the newly written data within this
     # block (e.g. an earlier run left more trim lines than this run needs).
@@ -1737,7 +1898,7 @@ def graft_richvalue_images(original_bytes, processed_bytes, sheet_name, owners, 
         part_name = "/" + part
         if f'PartName="{part_name}"' in ct_xml:
             continue
-        m = re.search(r'<Override PartName="' + re.escape(part_name) + r'"[^/]*/>', orig_ct_xml)
+        m = re.search(r'<Override PartName="' + re.escape(part_name) + r'"[^>]*/>', orig_ct_xml)
         if m:
             ct_additions.append(m.group(0))
     if ct_additions:
@@ -1838,13 +1999,10 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         # columns) gets physically moved into the canonical order here.
         field_cols = reorder_trim_fields(ws, field_cols, label_row)
 
-    # The 7 field names live as a second line inside the banner cell
-    # itself (e.g. "TRIM SCHEDULE") - never a separate row underneath,
-    # so no extra row is ever inserted anywhere on the sheet for this,
-    # and the very first data row for whichever style starts right
-    # after the banner (including any of its own already-existing
-    # hand-typed content) is never disturbed.
-    write_trim_banner_label(ws, banner_row, field_cols)
+    # Banner text stays on banner_row; the 7 field names go on their own
+    # dedicated label_row right below it - matching every other
+    # section's own two-row header on this sheet.
+    write_trim_banner_label(ws, banner_row, label_row, field_cols)
 
     # Save this exact layout so a later re-scan of this same file (a second
     # run) can recover it reliably even if the text-scan in find_fr_layout
@@ -1881,7 +2039,8 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
         res = fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out,
                                     preserve_existing=first_time,
                                     prior_structured_count=prior_structured,
-                                    prior_freeform_count=prior_freeform)
+                                    prior_freeform_count=prior_freeform,
+                                    label_row=label_row)
         if res is None:
             entry["status"] = "style_not_found_in_fr"
             results.append(entry)
@@ -1916,12 +2075,10 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
     # borders/fills render independently of this view setting.
     ws.sheet_view.showGridLines = False
 
-    # Freezes everything from the banner row up (the combined TRIM
-    # SCHEDULE banner + its 7 field labels, all in one row/cell) so it
-    # stays visible at the top while scrolling down through every
-    # style's rows below it - only the rows are frozen, not any
-    # columns, since that's the part the user actually asked to keep
-    # fixed in view.
-    ws.freeze_panes = ws.cell(row=banner_row + 1, column=1).coordinate
+    # Freezes everything down through the label row (the TRIM SCHEDULE
+    # banner AND its 7 field labels below it) so both stay visible at
+    # the top while scrolling down through every style's rows - only
+    # the rows are frozen, not any columns.
+    ws.freeze_panes = ws.cell(row=label_row + 1, column=1).coordinate
 
     return results

@@ -178,6 +178,7 @@ def status_text(code):
 
 st.title(T["title"])
 st.caption(T["caption"])
+st.caption(f"engine build: {engine.ENGINE_VERSION}")
 
 with st.expander(T["rules_expander"], expanded=False):
     st.markdown(T["rules_md"])

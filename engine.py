@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-23.5"
+ENGINE_VERSION = "2026-10-27.1"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -1258,6 +1258,21 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
         for rr in range(data_start, data_end + 1):
             ws.row_dimensions[rr].border = no_row_border
 
+        # Qty Needed / Stock / Shipped Qty are plain counts, never dates -
+        # but a cell can inherit a leftover date number format from
+        # whatever used to sit there (often copied from the adjacent
+        # ETD/ETA columns), which then displays a perfectly normal
+        # quantity as a garbled date. Forcing these three columns back to
+        # "General" here runs for every style block on every pass
+        # (including ones this run's own Balance Sheets never touched),
+        # so it cleans up old leftover formatting everywhere on the
+        # sheet, not just what gets freshly written this run.
+        qty_cols = [field_cols[f] for f in ("needed_qty", "stock", "shipped_qty") if f in field_cols]
+        if qty_cols:
+            for rr in range(data_start, data_end + 1):
+                for cc in qty_cols:
+                    ws.cell(row=rr, column=cc).number_format = "General"
+
         if outer_start <= last_col:
             for rr in range(data_start, data_end + 1):
                 for cc in range(outer_start, last_col + 1):
@@ -1532,6 +1547,12 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
                 c.border = border
                 c.font = font
                 c.alignment = align
+                if field in ("needed_qty", "stock", "shipped_qty"):
+                    # Plain counts, never dates - without this a cell can
+                    # inherit a leftover date format (often copied from
+                    # the adjacent ETD/ETA columns) and show a normal
+                    # quantity as a garbled date.
+                    c.number_format = "General"
             ws.row_dimensions[rr].height = 50
             i += 1
 

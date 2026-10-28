@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-28.1"
+ENGINE_VERSION = "2026-10-28.2"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 

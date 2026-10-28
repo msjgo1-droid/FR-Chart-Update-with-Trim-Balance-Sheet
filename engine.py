@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-27.1"
+ENGINE_VERSION = "2026-10-28.1"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -1984,8 +1984,88 @@ def graft_richvalue_images(original_bytes, processed_bytes, sheet_name, owners, 
                 continue
             zout.writestr(part, orig_zip.read(part))
 
+    final_bytes = out_buf.getvalue()
+
+    # This whole function does fragile regex surgery on openpyxl's raw
+    # XML output, which is only as reliable as openpyxl's exact output
+    # format staying what it was when this was written and tested
+    # against (a different openpyxl version writing attributes in a
+    # different order, say, could make a lookup silently match nothing).
+    # Rather than hand back a file that LOOKS done but is actually
+    # malformed - Excel's own "repair this file?" prompt is a very late
+    # and confusing place to discover that - validate the rebuilt zip
+    # here and raise instead, so the app shows a clear error up front.
+    problems = _validate_xlsx_zip_structure(final_bytes)
+    if problems:
+        raise EngineError("richvalue_graft_produced_invalid_zip: " + "; ".join(problems))
+
     info = {"restored": len(placements) - len(patch_failed), "failed": patch_failed + skipped}
-    return out_buf.getvalue(), info
+    return final_bytes, info
+
+
+def _validate_xlsx_zip_structure(xlsx_bytes):
+    """Cheap structural sanity check on a rebuilt .xlsx zip: every XML/rels
+    part parses, every part has content-type coverage in
+    [Content_Types].xml (an Override or a Default for its extension), and
+    every relationship target in every .rels file actually exists in the
+    zip. Returns a list of human-readable problem strings (empty if
+    everything checks out) - this is not a full OOXML validator, just the
+    handful of things that have been seen to make Excel refuse a
+    programmatically-rebuilt file and offer to "repair" it."""
+    import posixpath
+    problems = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+    except Exception as e:
+        return [f"not a valid zip: {e}"]
+
+    if zf.testzip() is not None:
+        problems.append("zip CRC check failed")
+
+    names = zf.namelist()
+    for n in names:
+        if n.endswith(".xml") or n.endswith(".rels"):
+            try:
+                ET.fromstring(zf.read(n))
+            except Exception as e:
+                problems.append(f"{n}: XML parse failed ({e})")
+
+    if "[Content_Types].xml" in names:
+        try:
+            ct = zf.read("[Content_Types].xml").decode("utf-8")
+            default_exts = set(re.findall(r'<Default Extension="([^"]+)"', ct))
+            override_parts = set(re.findall(r'<Override PartName="([^"]+)"', ct))
+            for n in names:
+                if n in ("[Content_Types].xml",) or n.endswith("/"):
+                    continue
+                part_name = "/" + n
+                ext = n.rsplit(".", 1)[-1] if "." in n else ""
+                if part_name in override_parts or ext in default_exts:
+                    continue
+                problems.append(f"{n}: no content-type coverage in [Content_Types].xml")
+        except Exception as e:
+            problems.append(f"[Content_Types].xml unreadable: {e}")
+
+    for n in names:
+        if not n.endswith(".rels"):
+            continue
+        base_dir = n.rsplit("_rels/", 1)[0]
+        try:
+            rels_xml = ET.fromstring(zf.read(n))
+        except Exception:
+            continue  # already reported above
+        for rel in rels_xml:
+            if rel.get("TargetMode") == "External":
+                continue
+            tgt = rel.get("Target") or ""
+            if tgt.startswith("/"):
+                resolved = tgt.lstrip("/")
+            else:
+                resolved = posixpath.normpath(posixpath.join(base_dir, tgt))
+            if resolved not in names:
+                problems.append(f"{n}: relationship target missing ({tgt})")
+
+    return problems
 
 
 class EngineError(Exception):

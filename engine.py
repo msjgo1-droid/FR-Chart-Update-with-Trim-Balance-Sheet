@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-28.2"
+ENGINE_VERSION = "2026-10-29.1"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -673,10 +673,19 @@ def find_fr_trim_anchor(ws, max_row=6, max_col=100):
     sheet), so every match in rows 1..max_row is collected and scored:
     the one whose own row's span IMMEDIATELY BELOW already contains
     recognizable sub-columns (item/qty/etd/eta/tracking/...) wins, since
-    that is the real grid; ties (e.g. on a brand-new file where no
-    sub-columns exist yet) fall back to the widest matching cell/merge,
-    since the real group header spans multiple columns while an unrelated
-    single-column deadline label does not."""
+    that is the real grid; on a tie (most often a brand-new file where no
+    sub-columns exist yet for ANY candidate), a candidate whose text
+    actually STARTS with "trim" wins next - a real section header is named
+    "TRIM" / "TRIM SCHEDULE" / "TRIM TEST", while an incidental mention
+    buried in a longer label ("HARD COPY + TRIM CARD + SAMPLE", "FB/TRIM
+    DUE", "BULK FB/TRIM SCHEDULE") has some other word first; among several
+    "starts with trim" candidates (e.g. a real "TRIM SCHEDULE" data-grid
+    header sitting next to its own unrelated single-column "TRIM TEST"
+    sibling), one that also says "schedule" wins next, since that is the
+    actual grid name on every chart seen so far; only after all of that
+    does the widest matching cell/merge win, since among otherwise-equal
+    candidates the real group header still spans multiple columns while an
+    unrelated single-column deadline label does not."""
     candidates = []
     for r in range(1, max_row + 1):
         for c in range(1, min(max_col, ws.max_column) + 1):
@@ -701,7 +710,10 @@ def find_fr_trim_anchor(ws, max_row=6, max_col=100):
             if _classify_trim_field(ws.cell(row=sub_row, column=cc).value):
                 field_count += 1
         width = c_end - c_start + 1
-        return (field_count, width, r, -c)
+        text = str(ws.cell(row=r, column=c).value).strip().lower()
+        starts_with_trim = 1 if text.startswith("trim") else 0
+        has_schedule = 1 if "schedule" in text else 0
+        return (field_count, starts_with_trim, has_schedule, width, r, -c)
 
     return max(candidates, key=score)
 
@@ -809,8 +821,30 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
     The caller writes the 7 field sub-labels into `label_row` afterward
     (write_trim_banner_label); this function only builds the column grid
     and the banner row itself.
+
+    The 2 columns immediately left of trim_col, and the 1 column
+    immediately right of the new 7-column grid, are only folded into the
+    rebuilt "BULK FB" / "TRIM" banners when they are still blank
+    placeholders on `banner_row` - the layout this was originally written
+    for (a single combined "BULK FB/TRIM..." banner over otherwise-unlabeled
+    columns). Some charts instead already have their own distinct,
+    already-labelled single-column sections right next to the trim grid
+    (e.g. a separate "BULK FABRIC SCHEDULE" column with its own real
+    fabric-notes content, a "FB TEST" column, a "TRIM TEST" column) - those
+    must be left completely untouched rather than relabelled/merged away,
+    or the trim grid ends up built on top of a neighboring section's own
+    column instead of its own.
     Returns field_cols: {field: column}."""
     fb_fill = copy.copy(ws.cell(row=banner_row, column=trim_col).fill)
+
+    bulk_start = trim_col - 2
+    bulk_end = trim_col - 1
+    bulk_has_own_header = bulk_start >= 1 and any(
+        ws.cell(row=banner_row, column=cc).value not in (None, "")
+        for cc in range(bulk_start, bulk_end + 1)
+    )
+    trailing_col = trim_col + 1
+    trailing_has_own_header = ws.cell(row=banner_row, column=trailing_col).value not in (None, "")
 
     n_other = len(TRIM_FIELD_ORDER) - 1  # 6
     safe_insert_cols(ws, trim_col + 1, n_other)
@@ -821,18 +855,25 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
 
     thin = Side(style='thin', color='000000')
     grid_last_col = trim_col + n_other   # last of our 7 columns
-    trim_end = grid_last_col + 1         # whatever followed TRIM originally (e.g. "Trim Test")
+    # Only swallow the column right after the grid into the "TRIM" banner
+    # when it was a blank placeholder (the combined-banner layout this was
+    # written for) - a column that already carries its own header (e.g.
+    # "TRIM TEST") keeps its own identity and is left out of the merge.
+    trim_end = grid_last_col if trailing_has_own_header else grid_last_col + 1
 
-    bulk_start = trim_col - 2
-    bulk_end = trim_col - 1
     trim_start = trim_col
 
     for existing in list(ws.merged_cells.ranges):
-        if existing.min_row == banner_row and bulk_start <= existing.min_col <= trim_end:
+        if existing.min_row == banner_row and trim_start <= existing.min_col <= trim_end:
             ws.unmerge_cells(start_row=existing.min_row, start_column=existing.min_col,
                               end_row=existing.max_row, end_column=existing.max_col)
+    if not bulk_has_own_header:
+        for existing in list(ws.merged_cells.ranges):
+            if existing.min_row == banner_row and bulk_start <= existing.min_col <= bulk_end:
+                ws.unmerge_cells(start_row=existing.min_row, start_column=existing.min_col,
+                                  end_row=existing.max_row, end_column=existing.max_col)
 
-    if bulk_start >= 1:
+    if bulk_start >= 1 and not bulk_has_own_header:
         ws.merge_cells(start_row=banner_row, start_column=bulk_start, end_row=banner_row, end_column=bulk_end)
         bulk_cell = ws.cell(row=banner_row, column=bulk_start)
         bulk_cell.value = "BULK FB"
@@ -845,11 +886,14 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
     trim_cell.font = Font(name="Calibri", size=20, bold=True)
     trim_cell.alignment = Alignment(horizontal='center', vertical='top', wrap_text=True)
 
-    for cc in range(bulk_start, trim_end + 1):
+    fill_start = bulk_start if (bulk_start >= 1 and not bulk_has_own_header) else trim_start
+    left_edge = fill_start
+    right_edge = trim_end
+    for cc in range(fill_start, trim_end + 1):
         cell = ws.cell(row=banner_row, column=cc)
         cell.fill = fb_fill
-        left = thin if cc in (bulk_start, trim_start) else None
-        right = thin if cc in (bulk_end, trim_end) else None
+        left = thin if cc == left_edge else None
+        right = thin if cc == right_edge else None
         cell.border = Border(left=left, right=right, top=thin, bottom=thin)
 
     widths = {

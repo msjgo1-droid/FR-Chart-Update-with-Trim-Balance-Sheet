@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-29.2"
+ENGINE_VERSION = "2026-10-29.3"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -1048,6 +1048,38 @@ def enumerate_style_blocks(ws, style_col):
         blocks.append((v, start, end))
         r = end + 1
     return blocks
+
+
+def set_left_section_top_align(ws, style_col, trim_col):
+    """Everything from column A (Brand) through "FB/Trim Due" - every
+    column left of the Bulk FB/Trim Schedule section itself - comes from
+    a template where some columns' cells are vertically centered and
+    others are top-aligned, which only becomes visible once a block has
+    enough real content (a long style description, several FPP dates
+    stacked up, ...) to actually show a gap. Force vertical='top' on
+    every one of those columns, for every style block, on every run -
+    horizontal alignment and wrap_text are left exactly as they were.
+
+    "FB/Trim Due" is the column immediately left of wherever the Bulk
+    FB/Trim Schedule section's own first column (the fabric-notes one)
+    sits, which setup_trim_grid_fresh already treats as trim_col - 2 -
+    so the boundary here is trim_col - 3, computed the same way rather
+    than re-deriving it from header text."""
+    boundary_col = trim_col - 3
+    if boundary_col < 1:
+        return
+    for _, start, end in enumerate_style_blocks(ws, style_col):
+        for col in range(1, boundary_col + 1):
+            for r in range(start, end + 1):
+                cell = ws.cell(row=r, column=col)
+                al = cell.alignment
+                if al.vertical == 'top':
+                    continue
+                cell.alignment = Alignment(
+                    horizontal=al.horizontal, vertical='top',
+                    wrap_text=al.wrap_text, text_rotation=al.text_rotation,
+                    indent=al.indent, shrink_to_fit=al.shrink_to_fit,
+                )
 
 
 def clean_trailing_columns(ws, field_cols, banner_row, style_col):
@@ -2253,6 +2285,14 @@ def process(fr_wb, fr_sheet_name, balance_sheets, split_keyword="hangtag", log=N
     # section's own column losing its border on rows that got freshly
     # inserted during a block growth - are wiped here, every run.
     clean_trailing_columns(ws, field_cols, banner_row, style_col)
+
+    # Every column from the very first one (Brand) through "FB/Trim Due" -
+    # everything left of the Bulk FB/Trim Schedule section itself - mixes
+    # top- and middle-aligned text depending on which template row it came
+    # from, which reads as inconsistent once a cell has enough text to
+    # actually show the difference. Pin all of it to top alignment, every
+    # style block, every run, leaving horizontal alignment/wrap untouched.
+    set_left_section_top_align(ws, style_col, trim_col)
 
     # The "messy from column X onward" look the user sees is not actual
     # cell formatting at all - it is Excel's own default gridline display

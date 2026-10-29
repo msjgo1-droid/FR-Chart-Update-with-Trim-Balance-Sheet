@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-29.1"
+ENGINE_VERSION = "2026-10-29.2"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -1366,6 +1366,36 @@ def clean_and_divide_style_blocks(ws, style_col, field_cols):
                                   top=existing.top, bottom=thin)
 
 
+def _extend_fresh_single_row_block(ws, block_start_row, new_end_row, grid_first_col):
+    """A style row that was exactly one row tall (no merge at all on any
+    of its own columns) just had blank rows inserted below it to fit the
+    trim grid. Every column to the left of the trim grid (style no,
+    description, sketch, in-charge, fit status, ...) should read as one
+    unified block spanning the style's full new height, the same way an
+    already multi-row style block elsewhere on this sheet does - so merge
+    each of those columns from block_start_row to new_end_row, carrying
+    the original single row's fill down the merge and drawing a plain
+    thin box around it (thin top only at block_start_row, thin bottom
+    only at new_end_row, thin left/right the whole way down) - the same
+    border shape every other real multi-row style block already uses."""
+    if new_end_row <= block_start_row:
+        return
+    thin = Side(style='thin', color='000000')
+    for col in range(1, grid_first_col):
+        if find_merge_at(ws, block_start_row, col):
+            continue  # already its own merge (shouldn't happen here, but don't clobber it)
+        fill = copy.copy(ws.cell(row=block_start_row, column=col).fill)
+        ws.merge_cells(start_row=block_start_row, start_column=col, end_row=new_end_row, end_column=col)
+        for rr in range(block_start_row, new_end_row + 1):
+            cell = ws.cell(row=rr, column=col)
+            cell.fill = fill
+            cell.border = Border(
+                left=thin, right=thin,
+                top=thin if rr == block_start_row else None,
+                bottom=thin if rr == new_end_row else None,
+            )
+
+
 def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, preserve_existing=False, prior_structured_count=0, prior_freeform_count=0, label_row=None):
     """Find the row block for `style_number` (freshly, since row positions
     may have shifted from earlier styles being grown) and write rows_out
@@ -1497,14 +1527,29 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     total_needed = n_needed + len(preserved_rows)
     available = end_row - start_row + 1
     added_rows = 0
-    if total_needed > available:
-        shortfall = total_needed - available
-        grow_block_insert_rows(ws, block_start_row, end_row, shortfall)
-        end_row += shortfall
-        added_rows = shortfall
 
     grid_cols = sorted(field_cols.values())
     grid_first_col, grid_last_col = grid_cols[0], grid_cols[-1]
+
+    if total_needed > available:
+        shortfall = total_needed - available
+        old_block_end = end_row
+        grow_block_insert_rows(ws, block_start_row, end_row, shortfall)
+        end_row += shortfall
+        added_rows = shortfall
+        # A style that was still a single, never-merged row (never grown
+        # before, and no colorway sub-rows splitting it) has nothing for
+        # grow_block_insert_rows to widen - every other column (style no,
+        # description, sketch, ...) is left as one real row sitting above
+        # a stack of brand-new blank ones, instead of growing to match the
+        # trim grid like an already-multi-row style block does. Only a
+        # block that was exactly 1 row before this growth qualifies - a
+        # block already spanning several rows (e.g. real per-colorway
+        # sub-rows) is left alone, since inferring which of its columns
+        # should merge together and which should stay split per line
+        # cannot be done safely from here.
+        if block_start_row == old_block_end:
+            _extend_fresh_single_row_block(ws, block_start_row, end_row, grid_first_col)
 
     # Clear out whatever currently occupies the trim grid columns for this
     # block: unmerge anything overlapping that area (an untouched single

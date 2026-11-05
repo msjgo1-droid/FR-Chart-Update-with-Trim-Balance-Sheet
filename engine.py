@@ -38,6 +38,7 @@ import re
 import io
 import json
 import copy
+import colorsys
 import zipfile
 import datetime
 import xml.etree.ElementTree as ET
@@ -49,7 +50,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-11-05.1"
+ENGINE_VERSION = "2026-11-05.2"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -500,15 +501,89 @@ def _any_filled(*vals):
     return any(_has_value(v) for v in vals)
 
 
-def _solid_rgb(cell):
-    """Return the raw ARGB hex string of a cell's solid fill (whatever
-    color it is), or None if the cell has no fill, or its fill is
-    theme-based rather than a plain RGB color. Balance Sheets carry
-    theme-based tints (fgColor.type == 'theme') across most cells as
-    base styling - this never returns those, only a literal solid RGB
-    fill, genuine or not; distinguishing a real highlight from an
-    ambient same-color band is done separately (see _is_highlight_color
-    and _dominant_colors)."""
+# Order that a workbook theme's 12 named colors (dk1/lt1/dk2/lt2/accent1-6/
+# hlink/folHlink, as listed in theme1.xml's <a:clrScheme>) map to the
+# small integer `theme` index a cell's fgColor actually stores - these are
+# NOT the same order (Excel swaps the first two pairs), so resolving a
+# theme color correctly means reading it through THIS order, never the
+# clrScheme's own document order.
+_THEME_STYLE_INDEX_ORDER = ["lt1", "dk1", "lt2", "dk2",
+                            "accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+                            "hlink", "folHlink"]
+
+
+def _parse_theme_colors(wb):
+    """Returns the workbook's 12 theme colors (6-char RGB hex, no alpha),
+    already reordered to match the `theme` index used by a cell's
+    fgColor/bgColor - i.e. theme_colors[cell_fg.theme] is directly usable.
+    None if the workbook carries no theme or it can't be parsed (a cell
+    fill that turns out to reference a theme color is then left alone,
+    never guessed at)."""
+    raw = getattr(wb, "loaded_theme", None)
+    if not raw:
+        return None
+    try:
+        ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+        root = ET.fromstring(raw)
+        scheme = root.find(".//a:clrScheme", ns)
+        if scheme is None:
+            return None
+        by_tag = {}
+        for tag in ["dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3",
+                    "accent4", "accent5", "accent6", "hlink", "folHlink"]:
+            el = scheme.find("a:" + tag, ns)
+            if el is None:
+                return None
+            srgb = el.find("a:srgbClr", ns)
+            if srgb is not None:
+                by_tag[tag] = srgb.get("val")
+            else:
+                sysClr = el.find("a:sysClr", ns)
+                if sysClr is None:
+                    return None
+                by_tag[tag] = sysClr.get("lastClr")
+        return [by_tag[tag] for tag in _THEME_STYLE_INDEX_ORDER]
+    except Exception:
+        return None
+
+
+def _apply_tint(rgb6, tint):
+    """Standard Excel/OOXML tint formula: lighten (tint > 0) or darken
+    (tint < 0) a base color by adjusting its HLS lightness, same
+    transform Excel itself applies to render a theme color's tinted
+    variants - this is what turns one plain theme base color (e.g. a
+    light gray "lt2") into the many different shades actually seen on
+    cells (a pale wash for one column, a visibly darker gray for
+    another), all from the same underlying theme."""
+    try:
+        r = int(rgb6[0:2], 16) / 255.0
+        g = int(rgb6[2:4], 16) / 255.0
+        b = int(rgb6[4:6], 16) / 255.0
+    except (ValueError, IndexError):
+        return rgb6
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    if tint < 0:
+        l = l * (1.0 + tint)
+    else:
+        l = l * (1.0 - tint) + tint
+    r2, g2, b2 = colorsys.hls_to_rgb(h, max(0.0, min(1.0, l)), s)
+    return "%02X%02X%02X" % (round(r2 * 255), round(g2 * 255), round(b2 * 255))
+
+
+def _resolve_fill_color(cell, theme_colors):
+    """Return the cell's actual solid-fill color as an 8-char ARGB hex
+    string (ready to hand straight to PatternFill), resolving a
+    theme-based fill (base theme color + tint) to its real displayed
+    RGB exactly the way Excel itself would render it - or None if the
+    cell has no fill, or its fill (plain or resolved) is effectively
+    white/transparent, i.e. no visible color at all.
+
+    This is a literal, unconditional mirror of whatever color sits in
+    that one cell - never filtered by what kind of color it is or how
+    common it is elsewhere in the column. Whichever cells the Balance
+    Sheet happens to color (all of them, a handful, any shade) carry
+    that same color over one-for-one; a cell the Balance Sheet leaves
+    uncolored stays uncolored here too."""
     if cell is None:
         return None
     try:
@@ -516,87 +591,49 @@ def _solid_rgb(cell):
         if fill is None or fill.patternType != "solid":
             return None
         fg = fill.fgColor
-        if fg is None or fg.type != "rgb":
+        if fg is None:
             return None
-        rgb = fg.rgb
-        if not rgb or not isinstance(rgb, str):
-            return None
-        rgb = rgb.upper()
-        if rgb in ("00000000", "FFFFFFFF"):
-            return None
-        return rgb
+        if fg.type == "rgb":
+            rgb = fg.rgb
+            if not rgb or not isinstance(rgb, str):
+                return None
+            rgb = rgb.upper()
+            if rgb in ("00000000", "FFFFFFFF"):
+                return None
+            return rgb
+        if fg.type == "theme" and theme_colors is not None:
+            theme_idx = fg.theme
+            if theme_idx is None or not (0 <= theme_idx < len(theme_colors)):
+                return None
+            resolved = _apply_tint(theme_colors[theme_idx], fg.tint or 0.0)
+            if resolved.upper() == "FFFFFF":
+                return None
+            return "FF" + resolved.upper()
+        return None
     except Exception:
         return None
 
 
-def _is_highlight_color(rgb):
-    """True only for a color that actually looks gray or yellow - the
-    two colors the user described ("회색 또는 노란색", gray or yellow).
-    Restricting to these (rather than treating any non-white solid RGB
-    fill as a highlight) is what keeps this from mistaking a Balance
-    Sheet's own solid-colored section banding - seen in practice as a
-    pink/magenta block spanning many consecutive rows in one column -
-    for a genuine per-row flag."""
-    if not rgb or len(rgb) < 6:
-        return False
-    hexpart = rgb[-6:]
-    try:
-        r = int(hexpart[0:2], 16)
-        g = int(hexpart[2:4], 16)
-        b = int(hexpart[4:6], 16)
-    except ValueError:
-        return False
-    # Yellow: red & green both high, blue clearly lower.
-    if r >= 180 and g >= 180 and (r - b) >= 60 and (g - b) >= 60:
-        return True
-    # Gray: all three channels close together, and not near-white/black.
-    maxc, minc = max(r, g, b), min(r, g, b)
-    if maxc - minc <= 12 and 40 <= maxc <= 235:
-        return True
-    return False
+def _capture_fill(cell, theme_colors):
+    """Thin, descriptively-named wrapper around _resolve_fill_color -
+    kept as its own name since every call site below reads as
+    "capture this cell's fill for carrying over.\""""
+    return _resolve_fill_color(cell, theme_colors)
 
 
-def _dominant_colors(ws, start, end, col, threshold=0.4):
-    """Returns the set of solid RGB colors that cover MORE than
-    `threshold` of the data rows in this one column - i.e. that
-    column's own ambient/base styling (a banded section, a template
-    default), not a one-off highlight. Any color found here is never
-    treated as a genuine highlight, however gray/yellow it looks,
-    since a color repeated across most of a column is background, not
-    a flag on a particular row."""
-    if col is None:
-        return set()
-    n = max(end - start + 1, 1)
-    counts = {}
-    for rr in range(start, end + 1):
-        rgb = _solid_rgb(ws.cell(row=rr, column=col))
-        if rgb:
-            counts[rgb] = counts.get(rgb, 0) + 1
-    return {rgb for rgb, cnt in counts.items() if cnt / n > threshold}
-
-
-def _capture_fill(cell, exclude=None):
-    """Return the RGB hex string of a cell's fill if it is a genuine,
-    intentional highlight - a plain solid RGB fill that (a) looks gray
-    or yellow and (b) is not this column's own dominant/ambient color -
-    or None otherwise."""
-    rgb = _solid_rgb(cell)
-    if not rgb:
-        return None
-    if exclude and rgb in exclude:
-        return None
-    if not _is_highlight_color(rgb):
-        return None
-    return rgb
-
-
-def _block_fill(ws, start, end, col, exclude=None):
+def _block_fill(ws, start, end, col, theme_colors):
     """Scan rows start..end in the given column and return the first
-    genuine highlight fill found, or None if none of them carry one."""
+    cell's resolved fill color found, or None if none of them carry
+    one. Used only for a field that is read once per multi-row ITEM
+    BLOCK rather than per individual row (Qty Needed/Stock, and a
+    leg's Shipped Qty when an item isn't split by size) - the block's
+    rows normally share one color already (they're one merged note or
+    one hand-colored group), so the first one found stands in for the
+    whole block."""
     if col is None:
         return None
     for rr in range(start, end + 1):
-        f = _capture_fill(ws.cell(row=rr, column=col), exclude=exclude)
+        f = _capture_fill(ws.cell(row=rr, column=col), theme_colors)
         if f:
             return f
     return None
@@ -645,23 +682,17 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
     order1 = layout["order1"]
     order2 = layout["order2"]
 
-    # Precompute, per column that feeds a fill-carrying field, whatever
-    # color covers most of that column's data rows - a Balance Sheet's
-    # own ambient section banding (seen in practice as one solid color
-    # running down many consecutive rows of a single column, e.g. the
-    # whole Stock column tinted pink for one item block). That color is
-    # never treated as a genuine per-row highlight for this column,
-    # however gray/yellow it might otherwise look, since every capture
-    # below excludes it.
-    _dom_cols = {c for c in [col_item, needed_qty_col, stock_col] if c}
-    for _order in (order1, order2):
-        if _order:
-            _dom_cols |= {c for c in [_order.get("etd"), _order.get("eta"),
-                                       _order.get("tracking"), _order.get("shipped_qty")] if c}
-    dom = {c: _dominant_colors(ws, layout["data_start"], layout["data_end"], c) for c in _dom_cols}
+    # Resolved once per Balance Sheet (not per cell) - every fill capture
+    # below uses this to turn a theme-based color into its real RGB, so
+    # a Balance Sheet's own color (whatever it is, on however many
+    # cells) carries over to the FR chart exactly as it appears here;
+    # nothing is excluded as "just background" - a cell the Balance
+    # Sheet colors gets that color in the FR chart, a cell it leaves
+    # plain stays plain, one-for-one, column-wide or a single cell.
+    theme_colors = _parse_theme_colors(ws.parent)
 
     def eff_fill(row, col):
-        return _capture_fill(eff_cell(row, col), exclude=dom.get(col))
+        return _capture_fill(eff_cell(row, col), theme_colors)
 
     # Every distinct item TYPE gets one sequential number (matching the
     # "1. CARE / 2. ZIPPER / ..." style already used by hand in these
@@ -698,7 +729,7 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
         etd_fill = eff_fill(rr, order.get("etd"))
         eta_fill = eff_fill(rr, order.get("eta"))
         track_fill = eff_fill(rr, order.get("tracking"))
-        qty_fill = (_capture_fill(ws.cell(row=rr, column=order["shipped_qty"]), exclude=dom.get(order["shipped_qty"]))
+        qty_fill = (_capture_fill(ws.cell(row=rr, column=order["shipped_qty"]), theme_colors)
                     if order.get("shipped_qty") else None)
         return etd_fill, eta_fill, track_fill, qty_fill
 
@@ -714,7 +745,7 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
         etd_fill = eff_fill(start, order.get("etd"))
         eta_fill = eff_fill(start, order.get("eta"))
         track_fill = eff_fill(start, order.get("tracking"))
-        qty_fill = _block_fill(ws, start, end, order.get("shipped_qty"), exclude=dom.get(order.get("shipped_qty")))
+        qty_fill = _block_fill(ws, start, end, order.get("shipped_qty"), theme_colors)
         return etd_fill, eta_fill, track_fill, qty_fill
 
     rows_out = []
@@ -741,9 +772,9 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                     stock_raw = ws.cell(row=rr, column=stock_col).value if stock_col else None
                     needed_fmt = _fmt_qty([needed_raw])
                     stock_fmt = _fmt_qty([stock_raw])
-                    needed_fill = (_capture_fill(ws.cell(row=rr, column=needed_qty_col), exclude=dom.get(needed_qty_col))
+                    needed_fill = (_capture_fill(ws.cell(row=rr, column=needed_qty_col), theme_colors)
                                    if needed_qty_col else None)
-                    stock_fill = (_capture_fill(ws.cell(row=rr, column=stock_col), exclude=dom.get(stock_col))
+                    stock_fill = (_capture_fill(ws.cell(row=rr, column=stock_col), theme_colors)
                                   if stock_col else None)
                     item_fill = eff_fill(start, col_item)
 
@@ -780,8 +811,8 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                               for rr in range(start, end + 1)] if stock_col else []
                 needed_fmt = _fmt_qty(needed_raws)
                 stock_fmt = _fmt_qty(stock_raws)
-                needed_fill = _block_fill(ws, start, end, needed_qty_col, exclude=dom.get(needed_qty_col))
-                stock_fill = _block_fill(ws, start, end, stock_col, exclude=dom.get(stock_col))
+                needed_fill = _block_fill(ws, start, end, needed_qty_col, theme_colors)
+                stock_fill = _block_fill(ws, start, end, stock_col, theme_colors)
                 item_fill = eff_fill(start, col_item)
 
                 etd1, eta1, track1, qtys1 = leg_values_block(start, end, order1)

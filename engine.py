@@ -49,7 +49,7 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-10-29.3"
+ENGINE_VERSION = "2026-11-05.1"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
@@ -500,6 +500,108 @@ def _any_filled(*vals):
     return any(_has_value(v) for v in vals)
 
 
+def _solid_rgb(cell):
+    """Return the raw ARGB hex string of a cell's solid fill (whatever
+    color it is), or None if the cell has no fill, or its fill is
+    theme-based rather than a plain RGB color. Balance Sheets carry
+    theme-based tints (fgColor.type == 'theme') across most cells as
+    base styling - this never returns those, only a literal solid RGB
+    fill, genuine or not; distinguishing a real highlight from an
+    ambient same-color band is done separately (see _is_highlight_color
+    and _dominant_colors)."""
+    if cell is None:
+        return None
+    try:
+        fill = cell.fill
+        if fill is None or fill.patternType != "solid":
+            return None
+        fg = fill.fgColor
+        if fg is None or fg.type != "rgb":
+            return None
+        rgb = fg.rgb
+        if not rgb or not isinstance(rgb, str):
+            return None
+        rgb = rgb.upper()
+        if rgb in ("00000000", "FFFFFFFF"):
+            return None
+        return rgb
+    except Exception:
+        return None
+
+
+def _is_highlight_color(rgb):
+    """True only for a color that actually looks gray or yellow - the
+    two colors the user described ("회색 또는 노란색", gray or yellow).
+    Restricting to these (rather than treating any non-white solid RGB
+    fill as a highlight) is what keeps this from mistaking a Balance
+    Sheet's own solid-colored section banding - seen in practice as a
+    pink/magenta block spanning many consecutive rows in one column -
+    for a genuine per-row flag."""
+    if not rgb or len(rgb) < 6:
+        return False
+    hexpart = rgb[-6:]
+    try:
+        r = int(hexpart[0:2], 16)
+        g = int(hexpart[2:4], 16)
+        b = int(hexpart[4:6], 16)
+    except ValueError:
+        return False
+    # Yellow: red & green both high, blue clearly lower.
+    if r >= 180 and g >= 180 and (r - b) >= 60 and (g - b) >= 60:
+        return True
+    # Gray: all three channels close together, and not near-white/black.
+    maxc, minc = max(r, g, b), min(r, g, b)
+    if maxc - minc <= 12 and 40 <= maxc <= 235:
+        return True
+    return False
+
+
+def _dominant_colors(ws, start, end, col, threshold=0.4):
+    """Returns the set of solid RGB colors that cover MORE than
+    `threshold` of the data rows in this one column - i.e. that
+    column's own ambient/base styling (a banded section, a template
+    default), not a one-off highlight. Any color found here is never
+    treated as a genuine highlight, however gray/yellow it looks,
+    since a color repeated across most of a column is background, not
+    a flag on a particular row."""
+    if col is None:
+        return set()
+    n = max(end - start + 1, 1)
+    counts = {}
+    for rr in range(start, end + 1):
+        rgb = _solid_rgb(ws.cell(row=rr, column=col))
+        if rgb:
+            counts[rgb] = counts.get(rgb, 0) + 1
+    return {rgb for rgb, cnt in counts.items() if cnt / n > threshold}
+
+
+def _capture_fill(cell, exclude=None):
+    """Return the RGB hex string of a cell's fill if it is a genuine,
+    intentional highlight - a plain solid RGB fill that (a) looks gray
+    or yellow and (b) is not this column's own dominant/ambient color -
+    or None otherwise."""
+    rgb = _solid_rgb(cell)
+    if not rgb:
+        return None
+    if exclude and rgb in exclude:
+        return None
+    if not _is_highlight_color(rgb):
+        return None
+    return rgb
+
+
+def _block_fill(ws, start, end, col, exclude=None):
+    """Scan rows start..end in the given column and return the first
+    genuine highlight fill found, or None if none of them carry one."""
+    if col is None:
+        return None
+    for rr in range(start, end + 1):
+        f = _capture_fill(ws.cell(row=rr, column=col), exclude=exclude)
+        if f:
+            return f
+    return None
+
+
 def extract_trim_rows(ws, layout, split_keyword="hangtag"):
     """Returns a list of dicts (one per TRIM_FIELD_ORDER field) for every
     line that should end up in the FR trim grid, following the confirmed
@@ -516,13 +618,17 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                 return mc
         return None
 
-    def eff(row, col):
+    def eff_cell(row, col):
         if col is None:
             return None
         mc = find_merge(row, col)
         if mc:
-            return ws.cell(row=mc.min_row, column=mc.min_col).value
-        return ws.cell(row=row, column=col).value
+            return ws.cell(row=mc.min_row, column=mc.min_col)
+        return ws.cell(row=row, column=col)
+
+    def eff(row, col):
+        c = eff_cell(row, col)
+        return c.value if c is not None else None
 
     def block_span(row, col):
         mc = find_merge(row, col)
@@ -538,6 +644,24 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
     col_code = layout.get("col_code")
     order1 = layout["order1"]
     order2 = layout["order2"]
+
+    # Precompute, per column that feeds a fill-carrying field, whatever
+    # color covers most of that column's data rows - a Balance Sheet's
+    # own ambient section banding (seen in practice as one solid color
+    # running down many consecutive rows of a single column, e.g. the
+    # whole Stock column tinted pink for one item block). That color is
+    # never treated as a genuine per-row highlight for this column,
+    # however gray/yellow it might otherwise look, since every capture
+    # below excludes it.
+    _dom_cols = {c for c in [col_item, needed_qty_col, stock_col] if c}
+    for _order in (order1, order2):
+        if _order:
+            _dom_cols |= {c for c in [_order.get("etd"), _order.get("eta"),
+                                       _order.get("tracking"), _order.get("shipped_qty")] if c}
+    dom = {c: _dominant_colors(ws, layout["data_start"], layout["data_end"], c) for c in _dom_cols}
+
+    def eff_fill(row, col):
+        return _capture_fill(eff_cell(row, col), exclude=dom.get(col))
 
     # Every distinct item TYPE gets one sequential number (matching the
     # "1. CARE / 2. ZIPPER / ..." style already used by hand in these
@@ -570,6 +694,14 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
         qty_raw = ws.cell(row=rr, column=order["shipped_qty"]).value if order.get("shipped_qty") else None
         return etd_raw, eta_raw, track_raw, qty_raw
 
+    def leg_fills_single_row(rr, order):
+        etd_fill = eff_fill(rr, order.get("etd"))
+        eta_fill = eff_fill(rr, order.get("eta"))
+        track_fill = eff_fill(rr, order.get("tracking"))
+        qty_fill = (_capture_fill(ws.cell(row=rr, column=order["shipped_qty"]), exclude=dom.get(order["shipped_qty"]))
+                    if order.get("shipped_qty") else None)
+        return etd_fill, eta_fill, track_fill, qty_fill
+
     def leg_values_block(start, end, order):
         etd_raw = eff(start, order.get("etd"))
         eta_raw = eff(start, order.get("eta"))
@@ -577,6 +709,13 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
         qtys_raw = [ws.cell(row=rr, column=order["shipped_qty"]).value
                     for rr in range(start, end + 1)] if order.get("shipped_qty") else []
         return etd_raw, eta_raw, track_raw, qtys_raw
+
+    def leg_fills_block(start, end, order):
+        etd_fill = eff_fill(start, order.get("etd"))
+        eta_fill = eff_fill(start, order.get("eta"))
+        track_fill = eff_fill(start, order.get("tracking"))
+        qty_fill = _block_fill(ws, start, end, order.get("shipped_qty"), exclude=dom.get(order.get("shipped_qty")))
+        return etd_fill, eta_fill, track_fill, qty_fill
 
     rows_out = []
     r = layout["data_start"]
@@ -602,26 +741,37 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                     stock_raw = ws.cell(row=rr, column=stock_col).value if stock_col else None
                     needed_fmt = _fmt_qty([needed_raw])
                     stock_fmt = _fmt_qty([stock_raw])
+                    needed_fill = (_capture_fill(ws.cell(row=rr, column=needed_qty_col), exclude=dom.get(needed_qty_col))
+                                   if needed_qty_col else None)
+                    stock_fill = (_capture_fill(ws.cell(row=rr, column=stock_col), exclude=dom.get(stock_col))
+                                  if stock_col else None)
+                    item_fill = eff_fill(start, col_item)
 
                     etd1, eta1, track1, qty1 = leg_values_single_row(rr, order1)
                     if _any_filled(etd1, eta1, track1, qty1):
+                        etd1_fill, eta1_fill, track1_fill, qty1_fill = leg_fills_single_row(rr, order1)
                         base = label_for(item_clean, start)
                         label = f"{base} ({size})" if size else base
                         rows_out.append(dict(
                             item=label, needed_qty=needed_fmt, stock=stock_fmt,
                             shipped_qty=_fmt_qty([qty1]), etd=_fmt_date(etd1),
                             eta=_fmt_date(eta1), tracking=_clean(track1),
+                            fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
+                                       shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill),
                         ))
 
                     if order2:
                         etd2, eta2, track2, qty2 = leg_values_single_row(rr, order2)
                         if _any_filled(etd2, eta2, track2, qty2):
+                            etd2_fill, eta2_fill, track2_fill, qty2_fill = leg_fills_single_row(rr, order2)
                             base = label_for(item_clean, start)
                             label = f"{base} ({size})" if size else base
                             rows_out.append(dict(
                                 item=f"{label}-2nd", needed_qty=needed_fmt, stock=stock_fmt,
                                 shipped_qty=_fmt_qty([qty2]), etd=_fmt_date(etd2),
                                 eta=_fmt_date(eta2), tracking=_clean(track2),
+                                fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
+                                           shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill),
                             ))
             else:
                 needed_raws = [ws.cell(row=rr, column=needed_qty_col).value
@@ -630,22 +780,31 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                               for rr in range(start, end + 1)] if stock_col else []
                 needed_fmt = _fmt_qty(needed_raws)
                 stock_fmt = _fmt_qty(stock_raws)
+                needed_fill = _block_fill(ws, start, end, needed_qty_col, exclude=dom.get(needed_qty_col))
+                stock_fill = _block_fill(ws, start, end, stock_col, exclude=dom.get(stock_col))
+                item_fill = eff_fill(start, col_item)
 
                 etd1, eta1, track1, qtys1 = leg_values_block(start, end, order1)
                 if _any_filled(etd1, eta1, track1, *qtys1):
+                    etd1_fill, eta1_fill, track1_fill, qty1_fill = leg_fills_block(start, end, order1)
                     rows_out.append(dict(
                         item=label_for(item_clean, start), needed_qty=needed_fmt, stock=stock_fmt,
                         shipped_qty=_fmt_qty(qtys1), etd=_fmt_date(etd1),
                         eta=_fmt_date(eta1), tracking=_clean(track1),
+                        fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
+                                   shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill),
                     ))
 
                 if order2:
                     etd2, eta2, track2, qtys2 = leg_values_block(start, end, order2)
                     if _any_filled(etd2, eta2, track2, *qtys2):
+                        etd2_fill, eta2_fill, track2_fill, qty2_fill = leg_fills_block(start, end, order2)
                         rows_out.append(dict(
                             item=f"{label_for(item_clean, start)}-2nd", needed_qty=needed_fmt, stock=stock_fmt,
                             shipped_qty=_fmt_qty(qtys2), etd=_fmt_date(etd2),
                             eta=_fmt_date(eta2), tracking=_clean(track2),
+                            fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
+                                       shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill),
                         ))
         r = end + 1
 
@@ -1626,13 +1785,13 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     n = len(tagged_rows)
     while i < n:
         _, vals = tagged_rows[i]
-        filled = [f for f, v in vals.items() if v is not None and str(v).strip() != ""]
+        filled = [f for f, v in vals.items() if f != "fills" and v is not None and str(v).strip() != ""]
         if len(filled) <= 1:
             run_start_i = i
             texts = []
             while i < n:
                 _, rvals = tagged_rows[i]
-                rfilled = [f for f, v in rvals.items() if v is not None and str(v).strip() != ""]
+                rfilled = [f for f, v in rvals.items() if f != "fills" and v is not None and str(v).strip() != ""]
                 if len(rfilled) > 1:
                     break
                 if rfilled:
@@ -1662,6 +1821,17 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
                 ws.row_dimensions[rr].height = 50
         else:
             rr = start_row + i
+            # A row freshly extracted from the Balance Sheet carries its
+            # own "fills" dict (field -> RGB hex or None), captured
+            # alongside its value by extract_trim_rows - whatever genuine
+            # highlight (gray, yellow, ...) that field's source cell had
+            # there is carried over onto this FR cell unchanged. A
+            # preserved/legacy row has no such dict, so every one of its
+            # fields is left with no fill. Either way the fill is always
+            # set explicitly (never skipped), so a cell that lost its
+            # highlight on a later Balance Sheet update doesn't keep
+            # showing a stale color from an earlier run.
+            fills = vals.get("fills") or {}
             for field, col in field_cols.items():
                 c = ws.cell(row=rr, column=col)
                 c.value = vals.get(field, "")
@@ -1674,6 +1844,11 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
                     # the adjacent ETD/ETA columns) and show a normal
                     # quantity as a garbled date.
                     c.number_format = "General"
+                highlight = fills.get(field)
+                if highlight:
+                    c.fill = PatternFill(fill_type="solid", start_color=highlight, end_color=highlight)
+                else:
+                    c.fill = PatternFill(fill_type=None)
             ws.row_dimensions[rr].height = 50
             i += 1
 
@@ -1681,11 +1856,13 @@ def fill_style_trim_grid(ws, style_col, field_cols, style_number, rows_out, pres
     # block (e.g. an earlier run left more trim lines than this run needs).
     no_side = Side(style=None)
     no_border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
+    no_fill = PatternFill(fill_type=None)
     for rr in range(start_row + total_needed, end_row + 1):
         for col in field_cols.values():
             cell = ws.cell(row=rr, column=col)
             cell.value = None
             cell.border = no_border
+            cell.fill = no_fill
 
     return dict(target_row=start_row, rows_written=n_needed, rows_preserved=len(preserved_rows),
                 rows_structured_preserved=len(structured_preserved),

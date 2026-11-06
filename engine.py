@@ -50,14 +50,14 @@ from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
 # Streamlit app is actually running this exact copy of engine.py, or an
 # older one left over from before a replaced file - a mismatch here has
 # been the cause of several rounds of "I already fixed that" confusion.
-ENGINE_VERSION = "2026-11-05.2"
+ENGINE_VERSION = "2026-11-06.1"
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Za-z]{1,3})(\$?)(\d+)')
 
 # Canonical order for a freshly-built TRIM grid, and the label written for
 # each field. "item" is always first (it anchors the whole section); the
 # other 6 follow the order the user asked for.
-TRIM_FIELD_ORDER = ["item", "needed_qty", "stock", "shipped_qty", "etd", "eta", "tracking"]
+TRIM_FIELD_ORDER = ["item", "needed_qty", "stock", "shipped_qty", "etd", "eta", "tracking", "remark"]
 TRIM_FIELD_LABELS = {
     "item": "Item",
     "needed_qty": "Qty Needed",
@@ -66,6 +66,7 @@ TRIM_FIELD_LABELS = {
     "etd": "ETD",
     "eta": "ETA",
     "tracking": "AWB#(Tracking#)",
+    "remark": "REMARK",
 }
 
 
@@ -82,6 +83,8 @@ def _classify_trim_field(text):
         return None
     # Most specific keywords first, so e.g. "QTY NEEDED" doesn't fall
     # through to the generic "qty" -> shipped_qty catch-all below.
+    if "remark" in t:
+        return "remark"
     if "need" in t:
         return "needed_qty"
     if "stock" in t:
@@ -386,6 +389,7 @@ def find_trim_section_layout(ws):
     stock_col = None
     col_mill = None
     col_code = None
+    col_remark = None
     for c in range(1, min(60, ws.max_column) + 1):
         v = ws.cell(row=header_row, column=c).value
         if v is None:
@@ -416,9 +420,28 @@ def find_trim_section_layout(ws):
             col_mill = c
         if col_code is None and "code" in vs:
             col_code = c
+        if col_remark is None and "remark" in vs:
+            col_remark = c
 
     if col_item is None:
         return None
+
+    # REMARK usually sits well to the right of the order-leg block(s) - in
+    # practice past this scan's normal 60-column cap on some wider sheets
+    # - and a few sheets label it one row down (beside the order legs' own
+    # ETD/ETA/Tracking sub-headers) instead of on header_row itself. Both
+    # are tried, widening the search, before giving up on it entirely -
+    # a sheet with no REMARK column at all just leaves this None, same as
+    # any other optional field.
+    if col_remark is None:
+        for scan_row in (header_row, header_row + 1):
+            for c in range(1, min(120, ws.max_column) + 1):
+                v = ws.cell(row=scan_row, column=c).value
+                if v is not None and "remark" in str(v).strip().lower():
+                    col_remark = c
+                    break
+            if col_remark is not None:
+                break
 
     sub_header_row = header_row + 1
     order1 = {}
@@ -445,6 +468,7 @@ def find_trim_section_layout(ws):
         stock_col=stock_col,
         col_mill=col_mill,
         col_code=col_code,
+        col_remark=col_remark,
         order1=order1,
         order2=order2,
     )
@@ -679,6 +703,7 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
     stock_col = layout["stock_col"]
     col_mill = layout.get("col_mill")
     col_code = layout.get("col_code")
+    col_remark = layout.get("col_remark")
     order1 = layout["order1"]
     order2 = layout["order2"]
 
@@ -777,6 +802,11 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                     stock_fill = (_capture_fill(ws.cell(row=rr, column=stock_col), theme_colors)
                                   if stock_col else None)
                     item_fill = eff_fill(start, col_item)
+                    # REMARK is one plain column (not per-shipment-leg), so
+                    # each size sub-row reads its own remark cell directly,
+                    # the same way its own Needed/Stock values are read.
+                    remark_val = _clean(eff(rr, col_remark))
+                    remark_fill = eff_fill(rr, col_remark)
 
                     etd1, eta1, track1, qty1 = leg_values_single_row(rr, order1)
                     if _any_filled(etd1, eta1, track1, qty1):
@@ -786,9 +816,10 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                         rows_out.append(dict(
                             item=label, needed_qty=needed_fmt, stock=stock_fmt,
                             shipped_qty=_fmt_qty([qty1]), etd=_fmt_date(etd1),
-                            eta=_fmt_date(eta1), tracking=_clean(track1),
+                            eta=_fmt_date(eta1), tracking=_clean(track1), remark=remark_val,
                             fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
-                                       shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill),
+                                       shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill,
+                                       remark=remark_fill),
                         ))
 
                     if order2:
@@ -800,9 +831,10 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                             rows_out.append(dict(
                                 item=f"{label}-2nd", needed_qty=needed_fmt, stock=stock_fmt,
                                 shipped_qty=_fmt_qty([qty2]), etd=_fmt_date(etd2),
-                                eta=_fmt_date(eta2), tracking=_clean(track2),
+                                eta=_fmt_date(eta2), tracking=_clean(track2), remark=remark_val,
                                 fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
-                                           shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill),
+                                           shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill,
+                                           remark=remark_fill),
                             ))
             else:
                 needed_raws = [ws.cell(row=rr, column=needed_qty_col).value
@@ -814,6 +846,8 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                 needed_fill = _block_fill(ws, start, end, needed_qty_col, theme_colors)
                 stock_fill = _block_fill(ws, start, end, stock_col, theme_colors)
                 item_fill = eff_fill(start, col_item)
+                remark_val = _clean(eff(start, col_remark))
+                remark_fill = eff_fill(start, col_remark)
 
                 etd1, eta1, track1, qtys1 = leg_values_block(start, end, order1)
                 if _any_filled(etd1, eta1, track1, *qtys1):
@@ -821,9 +855,10 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                     rows_out.append(dict(
                         item=label_for(item_clean, start), needed_qty=needed_fmt, stock=stock_fmt,
                         shipped_qty=_fmt_qty(qtys1), etd=_fmt_date(etd1),
-                        eta=_fmt_date(eta1), tracking=_clean(track1),
+                        eta=_fmt_date(eta1), tracking=_clean(track1), remark=remark_val,
                         fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
-                                   shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill),
+                                   shipped_qty=qty1_fill, etd=etd1_fill, eta=eta1_fill, tracking=track1_fill,
+                                   remark=remark_fill),
                     ))
 
                 if order2:
@@ -833,9 +868,10 @@ def extract_trim_rows(ws, layout, split_keyword="hangtag"):
                         rows_out.append(dict(
                             item=f"{label_for(item_clean, start)}-2nd", needed_qty=needed_fmt, stock=stock_fmt,
                             shipped_qty=_fmt_qty(qtys2), etd=_fmt_date(etd2),
-                            eta=_fmt_date(eta2), tracking=_clean(track2),
+                            eta=_fmt_date(eta2), tracking=_clean(track2), remark=remark_val,
                             fills=dict(item=item_fill, needed_qty=needed_fill, stock=stock_fill,
-                                       shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill),
+                                       shipped_qty=qty2_fill, etd=etd2_fill, eta=eta2_fill, tracking=track2_fill,
+                                       remark=remark_fill),
                         ))
         r = end + 1
 
@@ -1094,6 +1130,7 @@ def setup_trim_grid_fresh(ws, trim_col, banner_row, label_row, style_col):
         field_cols["etd"]: 10,
         field_cols["eta"]: 10,
         field_cols["tracking"]: 18,
+        field_cols["remark"]: 20,
     }
     for col, w in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = w
@@ -1129,7 +1166,7 @@ def ensure_trim_fields(ws, banner_row, label_row, trim_col, field_cols):
             if field_cols[k] >= insert_at:
                 field_cols[k] += 1
         field_cols[field] = insert_at
-        ws.column_dimensions[get_column_letter(insert_at)].width = 12
+        ws.column_dimensions[get_column_letter(insert_at)].width = 20 if field == "remark" else 12
 
     grid_cols = sorted(field_cols.values())
     first_col, last_col = grid_cols[0], grid_cols[-1]
@@ -1429,6 +1466,19 @@ def _merge_sparse_trim_rows(ws, field_cols, start, end):
             units.append({"start": rr, "end": rr, "text": str(filled[0][1]) if filled else ""})
         else:
             units.append({"start": rr, "end": rr, "text": None})  # structured row: a hard boundary
+            # A genuinely structured row is otherwise left exactly as it
+            # is here (its own border/value never touched). But when a
+            # brand-new field column has just been appended to the grid
+            # (e.g. REMARK added to a chart that already had real trim
+            # data written under the old, narrower field_cols), every row
+            # like this one anywhere on the sheet - not just the style
+            # being processed this run - needs that new column's cell to
+            # pick up the same full border as its siblings, or it would
+            # sit there as a blank, borderless gap in an otherwise clean
+            # bordered row. Re-applying the border to every field column
+            # here is harmless for a row that already had it.
+            for col in field_cols.values():
+                ws.cell(row=rr, column=col).border = border
         rr += 1
 
     i = 0
